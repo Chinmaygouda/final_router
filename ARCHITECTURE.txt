@@ -1,0 +1,380 @@
+"""
+UNIFIED ROUTER SYSTEM - ARCHITECTURE DIAGRAM
+=============================================
+
+This document provides visual representations of the unified system.
+"""
+
+# ==================== HIGH-LEVEL ARCHITECTURE ====================
+
+                        🌐 USER REQUESTS
+                             │
+                             ▼
+                   ┌──────────────────────┐
+                   │   app/main.py        │
+                   │  FastAPI Gateway     │
+                   └──────────┬───────────┘
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        │                     │                     │
+        ▼                     ▼                     ▼
+    ┌───────────┐       ┌──────────────┐    ┌──────────────┐
+    │   PHASE   │       │    PHASE     │    │    PHASE     │
+    │     1     │       │      2       │    │      3       │
+    │  VAULT    │◄──┐   │   ROUTER     │    │  DISPATCHER  │
+    │  LOOKUP   │   │   │              │    │              │
+    └────┬──────┘   │   │ Intelligent  │    │  Multi-      │
+         │ HIT?     │   │ Selection    │    │  Provider    │
+         ├─ YES ────┤   │              │    │  Execution   │
+         │          │   └──────┬───────┘    └──────┬───────┘
+         │          │          │                   │
+         │          │          └───────────┬───────┘
+         │          │                      │
+         │          │                  ┌───▼────────┐
+         │          │                  │  Response  │
+         │          │                  └───┬────────┘
+         │          │                      │
+         ▼          ▼                      ▼
+      RETURN ←── PHASE 4: STORAGE ────── PHASE 4: STORAGE
+      TO USER     PostgreSQL              Redis
+                  + Logging
+
+
+# ==================== DETAILED FLOW WITH DATABASES ====================
+
+                        REQUEST
+                          │
+                          ▼
+            ┌─────────────────────────────┐
+            │  app/main.py (/ask)         │
+            │  QueryRequest validation    │
+            └──────────────┬──────────────┘
+                           │
+                           ▼
+            ┌─────────────────────────────────────┐
+            │  app/vault_service.py               │
+            │  generate_embedding()               │
+            │  (HuggingFace + sentence-transform) │
+            └──────────────┬──────────────────────┘
+                           │
+                           ▼
+          ┌────────────────────────────────────────┐
+          │  app/vault_service.py                  │
+          │  semantic_search()                     │
+          │  - Query PostgreSQL + pgvector         │
+          │  - L2 distance matching                │
+          │  - Per-user privacy filter             │
+          └────────────┬──────────────────────────┘
+                       │
+             ┌─────────┴──────────┐
+             │                    │
+          CACHE HIT            CACHE MISS
+             │                    │
+             ▼                    ▼
+          Return             ┌──────────────────┐
+          Response           │  router.py       │
+          ($0 cost)          │  get_best_model()│
+                             │  - Complexity    │
+                             │  - Category      │
+                             │  - CoT check     │
+                             │  - Tier select   │
+                             └────┬─────────────┘
+                                  │
+                                  ▼
+                          ┌──────────────────┐
+                          │  dispatcher.py   │
+                          │  execute()       │
+                          │  - Route to:     │
+                          │    • OpenAI      │
+                          │    • Anthropic   │
+                          │    • Google      │
+                          │    • Cohere      │
+                          │    • xAI         │
+                          │    • etc.        │
+                          └────┬─────────────┘
+                               │
+                               ▼
+                        ┌──────────────────┐
+                        │  AI PROVIDER     │
+                        │  (Multi-choice)  │
+                        └────┬─────────────┘
+                             │
+                             ▼
+                    (text, tokens) response
+                             │
+                             ▼
+         ┌───────────────────────────────────┐
+         │  app/vault_service.py             │
+         │  save_to_vault()                  │
+         │  - PostgreSQL: UserConversation   │
+         │  - Redis: chat:{user_id}          │
+         │  - Topic detection                │
+         │  - Archiving if needed            │
+         │  - System logging                 │
+         └───────────────┬───────────────────┘
+                         │
+                         ▼
+                    Return Response
+                    (with metrics)
+
+
+# ==================== DATABASE SCHEMA VISUALIZATION ====================
+
+PostgreSQL DATABASE: semantic_vault
+├─ user_conversations (Semantic Vault)
+│  ├─ id (PK)
+│  ├─ user_id (indexed)
+│  ├─ prompt (text)
+│  ├─ response (text)
+│  ├─ model_used (string)
+│  ├─ tokens_consumed (int)
+│  ├─ actual_cost (float)
+│  ├─ embedding (Vector 768)
+│  └─ created_at (timestamp)
+│
+├─ system_logs (Event Tracking)
+│  ├─ id (PK)
+│  ├─ user_id
+│  ├─ event (string)
+│  └─ timestamp
+│
+├─ models (Router Registry)
+│  ├─ id (PK)
+│  ├─ model_id (string)
+│  ├─ provider (string)
+│  ├─ category (string)
+│  ├─ tier (1, 2, or 3)
+│  ├─ sub_tier (A or B)
+│  ├─ complexity_min (float)
+│  ├─ complexity_max (float)
+│  ├─ cost_per_1m_tokens (float)
+│  ├─ is_active (boolean)
+│  └─ last_audited (timestamp)
+│
+└─ conversation_archives (Session History)
+   ├─ id (PK)
+   ├─ session_id
+   ├─ topic_summary (string)
+   ├─ full_transcript (JSON)
+   └─ archived_at (timestamp)
+
+Redis CACHE: localhost:6379
+├─ chat:{user_id} → List[Message]
+├─ summary:{user_id} → String
+└─ count:{user_id} → Int
+
+
+# ==================== DISPATCHER ROUTING MATRIX ====================
+
+Provider          │ Base URL                                    │ Model Examples
+──────────────────┼─────────────────────────────────────────────┼──────────────────────
+OpenAI            │ https://api.openai.com/v1                   │ gpt-4, gpt-3.5-turbo
+OpenRouter        │ https://openrouter.ai/api/v1                │ gpt-4, claude-3, llama
+Google/Gemini     │ (native genai)                              │ gemini-2.5-flash, pro
+Anthropic         │ (native SDK)                                │ claude-3-opus, sonnet
+Cohere            │ (native SDK)                                │ command, command-light
+Together          │ https://api.together.xyz/v1                 │ mistral, llama, falcon
+DeepSeek          │ https://api.deepseek.com                    │ deepseek-chat
+xAI               │ https://api.x.ai/v1                         │ grok-beta
+Mistral           │ https://api.mistral.ai/v1                   │ mistral-small, large
+HuggingFace       │ https://api-inference.huggingface.co/v1     │ meta-llama, etc.
+
+
+# ==================== ROUTER DECISION TREE ====================
+
+User Prompt
+    │
+    ▼
+[Analyze with Gemini-Flash]
+    │
+    ├─ Complexity Score (1.0-10.0)
+    ├─ Category (CODE, ANALYSIS, CREATIVE, etc.)
+    ├─ Needs CoT? (True/False)
+    ├─ Logical Necessity? (True/False)
+    └─ Long Output? (True/False)
+         │
+         ▼
+[Apply Tier Optimization]
+    │
+    ├─ If user_tier==1:
+    │  └─ If NOT logical_necessary AND score<8.0:
+    │     └─ Downgrade to Tier 2
+    │
+    ├─ If score < 4.0 AND NOT long_output:
+    │  └─ Use Tier 3 (budget models)
+    │
+    └─ Otherwise: Keep tier
+         │
+         ▼
+[Query AIModel Table]
+    │
+    ├─ Filter by: is_active=True, tier=selected
+    ├─ Match 1: Exact category + complexity
+    ├─ Match 2: Any category + complexity
+    ├─ Match 3: Simplest in tier
+    │
+    ▼
+[Return Best Model]
+    model_id, provider, score, category, tier
+
+
+# ==================== CACHING MECHANISM ====================
+
+Request 1: "What is AI?"
+    │
+    ├─ Generate embedding: [0.234, 0.891, ..., 0.123] (768-dim)
+    ├─ L2 distance to vault entries: all > 0.5
+    ├─ No cache hit → Call API
+    ├─ Store in vault with embedding
+    └─ Cost: $0.001
+
+Request 2: "Tell me about artificial intelligence"
+    │
+    ├─ Generate embedding: [0.241, 0.885, ..., 0.118] (768-dim)
+    ├─ L2 distance comparison:
+    │  └─ Distance to Request 1: 0.32 < 0.5 ✓
+    ├─ CACHE HIT!
+    ├─ Return cached response
+    └─ Cost: $0.00
+
+Request 3: "How to cook pasta?"
+    │
+    ├─ Generate embedding: [0.125, 0.456, ..., 0.789] (768-dim)
+    ├─ L2 distance to all vault entries:
+    │  └─ All distances > 0.5 ✗
+    ├─ No cache hit → Call API
+    └─ Cost: $0.001
+
+
+# ==================== COST OPTIMIZATION EXAMPLE ====================
+
+SCENARIO: 100 API calls
+
+WITHOUT UNIFIED SYSTEM:
+├─ All calls to GPT-4 (most expensive)
+├─ Cost per call: $0.015
+└─ Total: 100 × $0.015 = $1.50
+
+WITH VAULT (Caching):
+├─ 50 calls (new questions): $0.015 each = $0.75
+├─ 50 calls (similar questions): $0.00 each = $0.00
+└─ Total: $0.75 (50% savings)
+
+WITH INTELLIGENT ROUTING:
+├─ 30 simple calls @ Tier 3: $0.0001 each = $0.003
+├─ 40 medium calls @ Tier 2: $0.005 each = $0.20
+├─ 30 complex calls @ Tier 1: $0.015 each = $0.45
+└─ Total: $0.653 (56% savings)
+
+WITH COMBINED (VAULT + ROUTING):
+├─ Vault cache hits (50%): $0.00 = $0.00
+├─ Tier 3 (30%): $0.0001 each = $0.0015
+├─ Tier 2 (15%): $0.005 each = $0.0075
+├─ Tier 1 (5%): $0.015 each = $0.0075
+└─ Total: $0.0165 (89% savings!)
+
+
+# ==================== SYSTEM FLOW - COMPLETE EXAMPLE ====================
+
+User sends:
+{
+  "user_id": "john_doe",
+  "prompt": "Implement a binary search algorithm in Python",
+  "user_tier": 1
+}
+
+System processes:
+
+1️⃣ PHASE 1: VAULT
+   └─ Embedding: [0.12, 0.45, ..., 0.89] (768 dims)
+   └─ Query: SELECT * WHERE embedding <-> [0.12...] < 0.5
+   └─ Result: No similar prompts found
+   └─ Status: VAULT MISS
+
+2️⃣ PHASE 2: ROUTER
+   └─ Gemini analysis: "This is CODE complexity 7.8, needs medium-tier model"
+   └─ Tier decision: Keep tier 1 (complex code task)
+   └─ Provider selected: OpenAI (best for code)
+   └─ Model selected: gpt-4-turbo
+
+3️⃣ PHASE 3: DISPATCHER
+   └─ OpenAI call with gpt-4-turbo
+   └─ Response: "def binary_search(arr, target):..."
+   └─ Tokens: 280
+   └─ Cost: (280 / 1,000,000) * 0.15 = $0.000042
+
+4️⃣ PHASE 4: STORAGE
+   └─ INSERT INTO user_conversations:
+      user_id: "john_doe"
+      prompt: "Implement a binary search..."
+      response: "def binary_search..."
+      model_used: "gpt-4-turbo"
+      tokens_consumed: 280
+      actual_cost: 0.000042
+      embedding: [0.12, 0.45, ..., 0.89]
+   └─ RPUSH chat:john_doe with message
+   └─ INSERT INTO system_logs: "AI_GENERATION_SUCCESS"
+
+RESPONSE TO USER:
+{
+  "status": "Success",
+  "source": "AI_GENERATION",
+  "data": {
+    "user_id": "john_doe",
+    "ai_response": "def binary_search(arr, target):\n...",
+    "metrics": {
+      "provider": "OpenAI",
+      "model_used": "gpt-4-turbo",
+      "complexity_score": 7.8,
+      "category": "CODE",
+      "tier": 1,
+      "tokens_consumed": 280,
+      "cost_usd": 0.000042
+    }
+  }
+}
+
+LATER: Similar question "Write Python binary search"
+└─ Vault HIT! Returns cached response + embedding
+└─ Cost: $0.00
+└─ Time: ~50ms vs 2 seconds
+
+
+# ==================== FILE DEPENDENCY GRAPH ====================
+
+app/main.py (FastAPI Gateway)
+├─ app/vault_service.py (Orchestrator)
+│  ├─ app/embedding_engine.py (Vector generation)
+│  ├─ app/database_init.py (DB initialization)
+│  ├─ database.py (Root connector)
+│  ├─ router.py (Model selection)
+│  │  └─ database.py
+│  │  └─ app/models.py
+│  ├─ dispatcher.py (Provider execution)
+│  │  └─ Multiple SDK imports
+│  └─ memory.py (Session management)
+│     └─ database.py
+│
+├─ app/embedding_engine.py
+│  └─ langchain_huggingface
+│
+└─ app/database_init.py
+   └─ app/models.py
+
+
+# ==================== MONITORING DASHBOARD DATA SOURCES ====================
+
+Dashboard Widget          │ Source Query
+──────────────────────────┼────────────────────────────────────────────
+Total Queries             │ SELECT COUNT(*) FROM user_conversations
+Cache Hit Rate            │ Compare VAULT_CACHE_HIT to total queries
+Cost per User             │ SELECT user_id, SUM(actual_cost)...
+Provider Usage            │ SELECT provider, COUNT(*)...
+Model Performance         │ SELECT model_used, AVG(tokens_consumed)...
+Average Response Time     │ SELECT AVG(EXTRACT(EPOCH FROM...
+Tier Distribution         │ SELECT tier, COUNT() FROM models...
+Redis Session Count       │ redis-cli KEYS "chat:*" | wc -l
+Error Rate                │ COUNT(event) WHERE event LIKE 'ERROR%'...
+
+
+Done! 🎉

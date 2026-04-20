@@ -1,0 +1,115 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-project
+*.sublime-workspace
+.project
+.pydevproject
+.settings/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+semantic_vault.db
+*.postgres
+
+# Logs
+logs/
+*.log
+*.logs
+
+# Cache
+.cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Testing
+.tox/
+.hypothesis/
+.pytest_cache/
+
+# Temporary files
+*.tmp
+*.bak
+.temp/
+temp/
+
+# OS
+Thumbs.db
+.DS_Store
+*.swp
+
+# Project specific
+.api_key_hash
+node_modules/
+dist/
+build/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Credentials (if any)
+secrets.json
+credentials.json
+config.private.json
+
+# Generated files
+*.generated.py
+
+# Documentation build
+docs/_build/
+
+# Node (if using any node tools)
+node_modules/
+npm-debug.log
+
+# Memory/Session files
+*.pkl
+*.pickle
+
+# Redis (local instance)
+dump.rdb
+appendonly.aof

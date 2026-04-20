@@ -1,0 +1,415 @@
+"""
+QUICK START GUIDE - Unified Router System
+==========================================
+
+This guide gets you up and running in 5 minutes.
+"""
+
+# ==================== 1. INSTALLATION ====================
+
+STEP 1: Install dependencies
+$ pip install fastapi uvicorn sqlalchemy psycopg2-binary pgvector
+$ pip install openai anthropic google-generativeai cohere redis
+$ pip install python-dotenv langchain langchain-huggingface
+
+STEP 2: Create .env file
+DATABASE_URL=postgresql://localhost/semantic_vault
+REDIS_HOST=localhost
+REDIS_PORT=6379
+
+GEMINI_API_KEY=your_gemini_key
+OPENAI_API_KEY=your_openai_key
+ANTHROPIC_API_KEY=your_anthropic_key
+COHERE_API_KEY=your_cohere_key
+GOOGLE_API_KEY=your_google_key
+XAI_API_KEY=your_xai_key
+OPENROUTER_API_KEY=your_openrouter_key
+TOGETHER_API_KEY=your_together_key
+DEEPSEEK_API_KEY=your_deepseek_key
+MISTRAL_API_KEY=your_mistral_key
+HUGGINGFACE_API_KEY=your_hf_key
+
+STEP 3: Setup PostgreSQL
+$ createdb semantic_vault
+$ psql semantic_vault -c "CREATE EXTENSION IF NOT EXISTS vector;"
+
+STEP 4: Initialize database
+$ python -c "from app.database_init import initialize_v2_db; initialize_v2_db()"
+
+STEP 5: Start Redis (choose one)
+$ docker run -d -p 6379:6379 redis:latest
+OR
+$ redis-server
+
+STEP 6: Start FastAPI
+$ uvicorn app.main:app --reload
+
+
+# ==================== 2. BASIC USAGE ====================
+
+PYTHON EXAMPLE:
+```python
+import requests
+
+url = "http://localhost:8000/ask"
+payload = {
+    "user_id": "user_123",
+    "prompt": "What is machine learning?",
+    "user_tier": 1
+}
+
+response = requests.post(url, json=payload)
+print(response.json())
+```
+
+CURL EXAMPLE:
+```bash
+curl -X POST http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "user_123",
+    "prompt": "What is machine learning?",
+    "user_tier": 1
+  }'
+```
+
+JAVASCRIPT EXAMPLE:
+```javascript
+const payload = {
+    user_id: "user_123",
+    prompt: "What is machine learning?",
+    user_tier: 1
+};
+
+fetch('http://localhost:8000/ask', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
+})
+.then(r => r.json())
+.then(data => console.log(data));
+```
+
+
+# ==================== 3. RESPONSE FORMATS ====================
+
+VAULT CACHE HIT ($0 cost):
+{
+  "status": "Success",
+  "source": "VAULT_CACHE",
+  "data": {
+    "user_id": "user_123",
+    "ai_response": "Machine learning is...",
+    "metrics": {
+      "source": "Cached Response",
+      "tokens_consumed": 0,
+      "cost_usd": 0.0,
+      "original_tokens": 150
+    }
+  }
+}
+
+FRESH AI GENERATION:
+{
+  "status": "Success",
+  "source": "AI_GENERATION",
+  "data": {
+    "user_id": "user_123",
+    "ai_response": "Machine learning is a subset of AI...",
+    "metrics": {
+      "provider": "Google",
+      "model_used": "gemini-2.5-flash",
+      "complexity_score": 5.5,
+      "category": "ANALYSIS",
+      "tier": 2,
+      "tokens_consumed": 150,
+      "cost_usd": 0.0011
+    }
+  }
+}
+
+
+# ==================== 4. USER TIERS ====================
+
+TIER 1 (Premium)
+├─ Access to most capable models
+├─ GPT-4, Claude 3 Opus, etc.
+├─ Best for complex tasks
+└─ More expensive
+
+TIER 2 (Standard)
+├─ Access to mid-tier models
+├─ GPT-3.5, Claude 3 Sonnet
+├─ Balanced cost/performance
+└─ Recommended default
+
+TIER 3 (Budget)
+├─ Access to budget models
+├─ Gemini Flash, Claude 3 Haiku
+├─ Best for simple tasks
+└─ Cheapest option
+
+USAGE:
+{
+  "user_id": "user_123",
+  "prompt": "Write code",
+  "user_tier": 1  # Use 1, 2, or 3
+}
+
+
+# ==================== 5. CATEGORY DETECTION ====================
+
+Your prompt will be automatically categorized as:
+
+CODE          → Programming tasks
+ANALYSIS      → Data analysis, logic puzzles
+CREATIVE      → Writing, brainstorming
+EXTRACTION    → Data scraping, parsing
+CHAT          → Conversation, Q&A
+AGENTS        → Multi-step planning
+UTILITY       → General tasks
+
+
+# ==================== 6. VAULT SEMANTICS ====================
+
+HOW SEMANTIC CACHING WORKS:
+
+Request 1: "What is machine learning?"
+└─ Generates embedding → Stores in vault
+└─ Cost: $0.001 (API call)
+└─ Source: AI_GENERATION
+
+Request 2: "Tell me about machine learning"
+└─ Similar embedding (L2 distance < 0.5)
+└─ Vault HIT! Returns cached response
+└─ Cost: $0.00 (no API call)
+└─ Source: VAULT_CACHE
+
+THRESHOLD: 0.5 (can be adjusted)
+└─ 0.1 = almost identical
+└─ 0.5 = similar (default)
+└─ 0.8 = loosely related
+
+Your vault persists across sessions:
+└─ More questions → More cache hits
+└─ More cache hits → Lower costs
+
+
+# ==================== 7. MONITORING ====================
+
+CHECK SYSTEM HEALTH:
+$ curl http://localhost:8000/health
+
+VIEW USER STATS:
+$ curl http://localhost:8000/vault/stats/user_123
+
+QUERY DATABASE:
+$ psql semantic_vault
+> SELECT * FROM system_logs WHERE user_id = 'user_123';
+> SELECT SUM(actual_cost) FROM user_conversations WHERE user_id = 'user_123';
+> SELECT provider, COUNT(*) FROM user_conversations GROUP BY provider;
+
+MONITOR REDIS:
+$ redis-cli INFO stats
+$ redis-cli LLEN chat:user_123
+$ redis-cli GET summary:user_123
+
+
+# ==================== 8. COST EXAMPLES ====================
+
+SCENARIO A: Repeated questions
+Request 1: Write Python code
+└─ Cost: $0.0085 (GPT-4 call)
+
+Request 2: Write Python code (same question)
+└─ Cost: $0.00 (vault cache hit)
+
+Request 3: Write some Python code (similar)
+└─ Cost: $0.00 (vault cache hit)
+
+TOTAL SAVED: $0.017
+
+
+SCENARIO B: Intelligent routing
+Request 1: "2 + 2 = ?" (simple)
+└─ Route: Tier 3 (Gemini Flash)
+└─ Cost: $0.00001
+
+Request 2: "Implement ResNet architecture" (complex)
+└─ Route: Tier 1 (GPT-4)
+└─ Cost: $0.015
+
+Request 3: "Fix this Python bug" (medium)
+└─ Route: Tier 2 (Claude 3 Sonnet)
+└─ Cost: $0.008
+
+AVERAGE COST: $0.008 (vs $0.015 if always using Tier 1)
+
+
+# ==================== 9. TESTING ====================
+
+RUN AUTOMATED TESTS:
+$ python test_gate.py
+
+This will:
+1. Test vault caching
+2. Test semantic similarity
+3. Test topic changes
+4. Test complex queries
+5. Verify metrics collection
+
+Expected output:
+✅ All tests pass
+✅ Cache hits show $0 cost
+✅ Metrics include provider, model, tier, cost
+
+
+# ==================== 10. TROUBLESHOOTING ====================
+
+ERROR: "Could not connect to Docker container"
+FIX: Redis is optional. System works without it (just slower)
+$ docker run -d -p 6379:6379 redis:latest
+
+ERROR: "DATABASE_URL not set"
+FIX: Add DATABASE_URL to .env file
+$ echo "DATABASE_URL=postgresql://localhost/semantic_vault" >> .env
+
+ERROR: "401 Unauthorized" (API key error)
+FIX: Check your API keys are correct and have access
+$ grep OPENAI_API_KEY .env
+
+ERROR: "No module named 'app'"
+FIX: Make sure you're running from project root
+$ cd "d:\final router"
+$ python -c "from app.main import app"
+
+ERROR: "pgvector: No such extension"
+FIX: Enable pgvector extension
+$ psql semantic_vault -c "CREATE EXTENSION IF NOT EXISTS vector;"
+
+ERROR: Connection timeout
+FIX: Verify PostgreSQL is running
+$ psql -l
+
+
+# ==================== 11. ADVANCED USAGE ====================
+
+SETTING USER TIER BASED ON SUBSCRIPTION:
+```python
+tiers = {
+    "free": 3,      # Budget models only
+    "pro": 2,       # Standard models
+    "enterprise": 1  # Premium models
+}
+
+user_plan = "pro"  # From database
+tier = tiers[user_plan]
+
+response = requests.post(url, json={
+    "user_id": "user_123",
+    "prompt": "...",
+    "user_tier": tier
+})
+```
+
+BATCH PROCESSING:
+```python
+for question in questions:
+    response = requests.post(url, json={
+        "user_id": "batch_user",
+        "prompt": question
+    })
+    # Later questions may hit vault = cheaper!
+```
+
+COST OPTIMIZATION:
+```python
+# Simple questions → Tier 3 (cheap)
+# Medium questions → Tier 2 (balanced)
+# Complex questions → Tier 1 (capable)
+
+if len(prompt) < 50:
+    tier = 3  # Simple
+elif "implement" in prompt or "code" in prompt:
+    tier = 1  # Complex
+else:
+    tier = 2  # Default
+```
+
+
+# ==================== 12. PRODUCTION DEPLOYMENT ====================
+
+DOCKER COMPOSE (recommended):
+```yaml
+version: '3'
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: semantic_vault
+      POSTGRES_PASSWORD: password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:latest
+    ports:
+      - "6379:6379"
+
+  app:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://postgres:password@postgres/semantic_vault
+    depends_on:
+      - postgres
+      - redis
+
+volumes:
+  postgres_data:
+```
+
+GUNICORN (production ASGI):
+```bash
+gunicorn app.main:app --workers 4 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000
+```
+
+NGINX (reverse proxy):
+```nginx
+upstream app {
+    server app:8000;
+}
+
+server {
+    listen 80;
+    location / {
+        proxy_pass http://app;
+    }
+}
+```
+
+
+# ==================== NEED HELP? ====================
+
+Check these files:
+- INTEGRATION_GUIDE.txt (comprehensive documentation)
+- IMPLEMENTATION_SUMMARY.txt (what was built)
+- app/main.py (implementation details)
+- app/vault_service.py (how features work)
+
+Test the system:
+$ python test_gate.py
+
+View logs:
+$ psql semantic_vault -c "SELECT * FROM system_logs ORDER BY timestamp DESC LIMIT 10;"
+
+Check costs:
+$ psql semantic_vault -c "SELECT user_id, SUM(actual_cost) as total_cost FROM user_conversations GROUP BY user_id;"
+
+Monitor performance:
+$ curl http://localhost:8000/health
+
+
+Good luck! 🚀
