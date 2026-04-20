@@ -52,10 +52,10 @@ r = None
 #     REDIS_AVAILABLE = True
 #     print("✅ Redis connected successfully")
 # except redis.exceptions.ConnectionError as e:
-#     print(f"⚠️ Redis connection failed: {e}")
+#     print(f"[WARNING] Redis connection failed: {e}")
 #     r = None
 #     REDIS_AVAILABLE = False
 
-print("⏭️  Redis disabled (using PostgreSQL only)")
+print("[INFO] Redis disabled (using PostgreSQL only)")
 
 __all__ = ["SessionLocal", "engine", "r", "REDIS_AVAILABLE", "initialize_db"]

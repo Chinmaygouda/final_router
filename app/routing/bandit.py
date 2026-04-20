@@ -24,5 +24,5 @@ def call_bandit(candidates):
         return candidates[0]["name"]
     
     # Explore second-best model (exploration over exploitation)
-    print(f"⚡ LOW CONFIDENCE: Bandit triggered - exploring {candidates[1]['name']} instead of {candidates[0]['name']}")
+    print(f"[LOW] Bandit triggered - exploring {candidates[1]['name']} instead of {candidates[0]['name']}")
     return candidates[1]["name"]
