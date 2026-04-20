@@ -1,16 +1,24 @@
 import os
 import json
+import sys
+import importlib.util
 from google import genai
 from sqlalchemy import text
-from app.database_init import SessionLocal
 from app.embedding_engine import generate_vector
 from app.models import UserConversation, SystemLog
+from app.routing.router import get_best_model
+from core.dispatcher import Dispatcher
 
-# Import router and dispatcher for intelligent routing
-import sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from router import get_best_model
-from dispatcher import Dispatcher
+# Handle database module import (naming conflict with database/ directory)
+def _load_database_module():
+    spec = importlib.util.spec_from_file_location("root_database", 
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), "database.py"))
+    root_database = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(root_database)
+    return root_database
+
+root_database = _load_database_module()
+SessionLocal = root_database.SessionLocal
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 dispatcher = Dispatcher()

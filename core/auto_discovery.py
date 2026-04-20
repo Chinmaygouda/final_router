@@ -2,12 +2,24 @@
 
 
 import os
+import importlib.util
 import hashlib
 from datetime import datetime
 from openai import OpenAI
-from database import SessionLocal
+
+# Handle database module import (naming conflict with database/ directory)
+def _load_database_module():
+    spec = importlib.util.spec_from_file_location("root_database", 
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), "database.py"))
+    root_database = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(root_database)
+    return root_database
+
+root_database = _load_database_module()
+SessionLocal = root_database.SessionLocal
+
 from app.models import AIModel
-from librarian import audit_models
+from core.librarian import audit_models
 from dotenv import load_dotenv
 
 load_dotenv()
