@@ -36,13 +36,36 @@ def get_api_keys_hash():
     return hashlib.md5(combined.encode()).hexdigest()
 
 def should_update_models():
-    """Check if model update needed: (1) no models, (2) 30+ days, or (3) API keys changed."""
+    """Check if model update needed: (1) no discovered models, (2) 30+ days, or (3) API keys changed.
+    
+    BUG #8 FIX: Previously checked total model count, but main.py seeds 7 hardcoded models
+    at startup which made count > 0, so the Librarian was never triggered.
+    Now we check specifically for Librarian-discovered models (non-spacer, non-seed providers).
+    """
     db = SessionLocal()
+    SEED_PROVIDERS = {"---"}  # Spacer rows
     try:
-        # Check 1: No models
-        model_count = db.query(AIModel).count()
+        # Check 1: No Librarian-discovered models (ignore hardcoded seeds by checking last_audited)
+        # Seed models have last_audited = NOW() at creation, so we check for models
+        # that were added via the Librarian (which calls audit_models and sets no special flag).
+        # The most reliable proxy: if ALL models share the exact same last_audited second, 
+        # they were batch-seeded, not discovered.
+        from sqlalchemy import func
+        model_count = db.query(AIModel).filter(
+            ~AIModel.model_id.startswith("---")
+        ).count()
+        
         if model_count == 0:
-            print("📊 No models in database - updating...")
+            print("📊 No models in database - triggering Librarian discovery...")
+            return True
+        
+        # Check if ALL models are the hardcoded seed set (7 models with identical last_audited)
+        distinct_audit_times = db.query(func.count(func.distinct(
+            func.date_trunc('minute', AIModel.last_audited)
+        ))).filter(~AIModel.model_id.startswith("---")).scalar()
+        
+        if distinct_audit_times <= 1 and model_count <= 10:
+            print(f"📊 Only {model_count} seed/static models found - triggering Librarian discovery...")
             return True
         
         # Check 2: 30+ days since last audit
@@ -211,9 +234,11 @@ def run_30_day_refresh():
         except Exception as e:
             print(f"   ⚠️ Error processing {provider}: {e}")
     
-    # Update last_audited timestamp
+    # BUG #2 + #3 FIX: db.execute() with a raw string was removed in SQLAlchemy 2.0.
+    # Also the table name was wrong: SQLAlchemy maps AIModel → table 'models', NOT 'ai_model'.
     try:
-        db.execute("UPDATE ai_model SET last_audited = NOW()")
+        from sqlalchemy import text
+        db.execute(text("UPDATE models SET last_audited = NOW() WHERE model_id NOT LIKE '---%'"))
         db.commit()
         print("\n✅ Updated last_audited timestamps")
     except Exception as e:

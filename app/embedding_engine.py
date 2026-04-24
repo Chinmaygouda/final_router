@@ -1,12 +1,17 @@
 import os
 from langchain_huggingface import HuggingFaceEmbeddings
 
-# This loads the model locally. The first time it runs, it will download (~400MB).
-# After that, it works 100% offline and for free.
-model_name = "sentence-transformers/all-mpnet-base-v2"
+# Embedding model for semantic vault search.
+# UPGRADED from sentence-transformers/all-mpnet-base-v2 to BAAI/bge-base-en-v1.5
+# - Same 768 dimensions (no DB schema change needed)
+# - MTEB score: 63.5 vs 57.8 (significantly better semantic distinction)
+# - Better at distinguishing "sorting algorithm" from "searching algorithm"
+# First run downloads ~440MB, then works 100% offline and free.
+model_name = "BAAI/bge-base-en-v1.5"
 local_embeddings = HuggingFaceEmbeddings(
     model_name=model_name,
-    model_kwargs={'device': 'cpu'} 
+    model_kwargs={'device': 'cpu'},
+    encode_kwargs={'normalize_embeddings': True}  # BGE models require normalization
 )
 
 def generate_vector(text: str):

@@ -188,10 +188,36 @@ _global_sampler = None
 
 
 def get_thompson_sampler() -> ThompsonSampler:
-    """Get or create global Thompson Sampler instance."""
+    """Get or create global Thompson Sampler instance.
+    On first call, loads historical α/β from ModelPerformance DB table."""
     global _global_sampler
     if _global_sampler is None:
         _global_sampler = ThompsonSampler()
+        # FIX #6: Load persisted bandit state from database
+        try:
+            from database.session import SessionLocal
+            from app.models import ModelPerformance
+            db = SessionLocal()
+            records = db.query(ModelPerformance).all()
+            loaded = 0
+            for r in records:
+                alpha = r.alpha if r.alpha and r.alpha > 0 else 1.0
+                beta = r.beta if r.beta and r.beta > 0 else 1.0
+                _global_sampler.register_model(r.model_id, initial_alpha=alpha, initial_beta=beta)
+                # Restore stats
+                _global_sampler.model_stats[r.model_id] = {
+                    "selections": r.total_selections or 0,
+                    "successes": r.successful_responses or 0,
+                    "failures": r.failed_responses or 0,
+                    "total_reward": r.total_reward or 0.0,
+                    "avg_reward": r.avg_reward or 0.0
+                }
+                loaded += 1
+            db.close()
+            if loaded > 0:
+                print(f"[BANDIT] Loaded {loaded} model performance records from database")
+        except Exception as e:
+            print(f"[BANDIT] Could not load DB state (non-fatal): {e}")
     return _global_sampler
 
 

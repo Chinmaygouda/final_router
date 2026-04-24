@@ -101,8 +101,8 @@ class DeBertaClassifier:
         """Get category, confidence, and complexity heuristic."""
         category, confidence = self.classify_prompt(prompt)
         
-        # Use the same heuristic logic for complexity scale (1-10)
-        complexity_score = self._estimate_complexity(prompt)
+        # Use the production heuristic for complexity scale (1-10)
+        complexity_score = self._estimate_complexity(prompt, category)
         
         if complexity_score < 4.0:
             complexity_label = "EASY"
@@ -113,24 +113,174 @@ class DeBertaClassifier:
             
         return category, confidence, complexity_label
 
-    def _estimate_complexity(self, prompt: str) -> float:
-        """Heuristic complexity estimator."""
-        score = 1.0
-        word_count = len(prompt.split())
-        score += min(word_count / 100, 3.0)
+    def _estimate_complexity(self, prompt: str, category: str = "") -> float:
+        """
+        Production-ready complexity estimator.
+        Scores prompts from 1.0 to 10.0 using multi-signal heuristics.
         
-        technical_keywords = [
-            "algorithm", "optimization", "architecture", "regex", "async", 
-            "concurrency", "distributed", "kubernetes", "api gateway", "database"
+        KEY FIX: Expands common abbreviations before matching so that
+        'ml', 'dl', 'cv', 'nlp', 'llm' are correctly recognized as
+        high-complexity topics rather than unknown words.
+        """
+        score = 1.0
+
+        # ── PRE-PROCESSING: Expand common abbreviations ──
+        # This is the root cause fix for 'ml pipeline' scoring as EASY.
+        ABBREVIATIONS = {
+            r"\bml\b":   "machine learning",
+            r"\bdl\b":   "deep learning",
+            r"\bcv\b":   "computer vision",
+            r"\bnlp\b":  "natural language processing",
+            r"\bllm\b":  "large language model",
+            r"\bai\b":   "artificial intelligence",
+            r"\bnn\b":   "neural network",
+            r"\bcnn\b":  "convolutional neural network",
+            r"\brnn\b":  "recurrent neural network",
+            r"\bgpu\b":  "graphics processing unit hardware",
+            r"\bapi\b":  "api endpoint",
+            r"\bdb\b":   "database",
+            r"\boci\b":  "container image",
+        }
+        import re
+        prompt_lower = prompt.lower()
+        for pattern, replacement in ABBREVIATIONS.items():
+            prompt_lower = re.sub(pattern, replacement, prompt_lower)
+
+        word_count = len(prompt.split())
+
+        # ── SIGNAL 1: LENGTH SCALING (max +3.0) ──
+        if word_count >= 40:
+            score += 3.0
+        elif word_count >= 10:
+            score += (word_count - 10) / 10.0
+
+        # ── SIGNAL 2: CRITICAL COMPLEXITY KEYWORDS (each +1.5) ──
+        critical_keywords = [
+            # Distributed systems
+            "distributed", "microservices", "kubernetes", "k8s",
+            "race condition", "deadlock", "concurrency", "multithreading",
+            # ML / AI (these now match after abbreviation expansion)
+            "machine learning", "deep learning", "neural network", "transformer",
+            "large language model", "natural language processing",
+            "convolutional neural network", "recurrent neural network",
+            "computer vision", "artificial intelligence",
+            # ML pipelines and workflows
+            "ml pipeline", "data pipeline", "training pipeline", "inference pipeline",
+            "feature engineering", "model training", "model inference",
+            "hyperparameter", "fine-tuning", "transfer learning",
+            "object detection", "image classification", "image segmentation",
+            "multimodal", "multi-modal", "vision language",
+            # System design
+            "system design", "architecture design", "design pattern",
+            "security vulnerability", "sql injection", "authentication",
+            "real-time", "event-driven", "message queue",
         ]
-        for keyword in technical_keywords:
-            if keyword.lower() in prompt.lower():
-                score += 0.5
-                
-        if any(indicator in prompt.lower() for indicator in ["debug", "fix", "error"]):
+        for kw in critical_keywords:
+            if kw in prompt_lower:
+                score += 1.5
+
+        # ── SIGNAL 2B: DESIGN / BUILD INTENT BOOST (+2.0) ──
+        # "design a pipeline", "build an ml system", "create an architecture"
+        # These are always complex tasks regardless of length.
+        design_intent_keywords = [
+            "design", "architect", "pipeline", "framework", "system",
+            "end-to-end", "end to end", "full stack", "production",
+            "deploy", "scalable", "robust", "enterprise",
+        ]
+        design_hits = sum(1 for kw in design_intent_keywords if kw in prompt_lower)
+        if design_hits >= 3:
+            score += 2.0   # Full system design intent
+        elif design_hits >= 1:
+            score += 1.0   # Partial design intent
+
+        # ── SIGNAL 3: ADVANCED TECHNICAL KEYWORDS (each +1.0) ──
+        advanced_keywords = [
+            "algorithm", "optimization", "complexity", "recursion",
+            "dynamic programming", "memoization", "binary search",
+            "async", "await", "promise", "callback",
+            "api gateway", "load balancer", "proxy", "nginx",
+            "docker", "container", "deployment", "ci/cd",
+            "database", "postgresql", "mongodb", "redis", "sql",
+            "regex", "parser", "compiler", "interpreter",
+            "websocket", "grpc", "graphql", "rest api",
+            "encryption", "hashing", "jwt", "oauth",
+            "architecture", "scalable", "orchestration",
+            # ML specific advanced
+            "dataset", "annotation", "labeling", "augmentation",
+            "batch size", "learning rate", "epoch", "loss function",
+            "accuracy", "precision", "recall", "f1", "confusion matrix",
+            "embedding", "vector", "tokenizer", "preprocessing",
+            "backbone", "encoder", "decoder", "attention",
+            "detection", "segmentation", "classification", "recognition",
+            "ore", "mineral", "satellite", "remote sensing", "geospatial",
+        ]
+        for kw in advanced_keywords:
+            if kw in prompt_lower:
+                score += 1.0
+
+        # ── SIGNAL 4: MODERATE TECHNICAL KEYWORDS (each +0.6) ──
+        moderate_keywords = [
+            "function", "class", "object", "method", "variable",
+            "loop", "array", "list", "dictionary", "tuple",
+            "import", "module", "package", "library",
+            "endpoint", "request", "response",
+            "json", "csv", "xml", "html", "css",
+            "python", "javascript", "java", "react", "node",
+            "git", "github", "version control",
+            "test", "unittest", "pytest",
+            "sort", "search", "filter", "map", "reduce",
+        ]
+        for kw in moderate_keywords:
+            if kw in prompt_lower:
+                score += 0.6
+
+        # ── SIGNAL 5: DEBUGGING / FIX INDICATORS ──
+        debug_keywords = [
+            "debug", "fix", "error", "bug", "crash", "broken",
+            "not working", "fails", "failing", "exception",
+            "traceback", "stack trace", "segfault", "memory leak",
+            "TypeError", "ValueError", "KeyError", "IndexError",
+            "SyntaxError", "NameError", "AttributeError",
+        ]
+        debug_hits = sum(1 for kw in debug_keywords if kw.lower() in prompt_lower)
+        if debug_hits >= 3:
+            score += 3.0
+        elif debug_hits >= 1:
+            score += 2.0
+
+        # ── SIGNAL 6: MULTI-STEP DETECTION (+1.5) ──
+        multi_step_markers = [
+            "first", "then", "next", "finally", "after that",
+            "step 1", "step 2", "and then", "also", "additionally",
+            "furthermore", "moreover", "should also", "must also",
+        ]
+        step_hits = sum(1 for m in multi_step_markers if m in prompt_lower)
+        if step_hits >= 2:
+            score += 1.5
+
+        # ── SIGNAL 7: CODE STRUCTURE DETECTION ──
+        code_indicators = [
+            "def ", "class ", "import ", "from ", "return ",
+            "if __name__", "try:", "except:", "for ", "while "
+        ]
+        code_hits = sum(1 for c in code_indicators if c in prompt)
+        if code_hits >= 4:
+            score += 2.5
+        elif code_hits >= 2:
+            score += 1.5
+        elif code_hits >= 1:
+            score += 0.5
+
+        # ── SIGNAL 8: CATEGORY-AWARE BOOST ──
+        category_upper = category.upper()
+        if category_upper in ("CODE", "AGENTS"):
             score += 1.0
-            
-        return min(max(score, 1.0), 10.0)
+        elif category_upper in ("ANALYSIS", "EXTRACTION"):
+            score += 0.5
+
+        # Clamp to valid range
+        final = min(max(score, 1.0), 10.0)
+        return final
 
 # Global singleton
 _deberta_classifier = None

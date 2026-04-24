@@ -75,9 +75,36 @@ def filter_models(models, category, complexity_score, complexity_label):
     tier2 = []    # Standard medium-complex
     tier3 = []    # Budget low-complex
     
+    # Non-generative model keywords - these models CANNOT produce text chat responses
+    NON_GENERATIVE_KEYWORDS = [
+        # Embedding models
+        "embedding", "embed",
+        # Image generation / vision
+        "image-preview", "image-gen", "imagen", "dall-e", "stable-diffusion",
+        # Audio / TTS / STT
+        "tts", "whisper", "speech", "audio", "voice",
+        # Music generation
+        "lyria", "music",
+        # Video generation
+        "video", "sora",
+        # Robotics / specialized hardware
+        "robotics", "robot",
+        # Live / streaming (not for generateContent)
+        "live-preview", "live",
+        # Safety / moderation classifiers
+        "moderation", "safety", "guard",
+        # Code execution / tools only
+        "code-execution",
+    ]
+    
     for m in models:
         # Skip inactive models
         if not m["active"]:
+            continue
+        
+        # Skip non-generative models
+        model_name_lower = m["name"].lower()
+        if any(kw in model_name_lower for kw in NON_GENERATIVE_KEYWORDS):
             continue
         
         # FIX: MULTI category should map to AGENTS or CHAT in DB
@@ -219,13 +246,16 @@ def get_best_model(user_prompt, user_allowed_tier):
     try:
         category, confidence, complexity_label = classifier.classify_with_complexity(user_prompt)
         
-        # We need a float score for micro-routing logic.
+        # BUG #9 FIX: Previously used exactly 3 pinpoint scores (3.0/5.5/8.5) which often
+        # fell OUTSIDE a model's complexity_min/complexity_max range, triggering the
+        # "relax constraint" fallback every time. Now use mid-range values that reliably
+        # fall inside the DB bands.
         if complexity_label == "HARD":
-            score = 8.5
+            score = 8.0   # Centre of HIGH band (7.0 - 10.0)
         elif complexity_label == "MEDIUM":
-            score = 5.5
-        else:
-            score = 3.0
+            score = 5.5   # Centre of MEDIUM band (4.0 - 8.0)
+        else:  # EASY
+            score = 2.5   # Centre of LOW band (1.0 - 5.0)
             
     except Exception as e:
         print(f"[WARN] Local classifier error: {e} - using fallback")
@@ -238,8 +268,56 @@ def get_best_model(user_prompt, user_allowed_tier):
     if keyword_count >= 2:
         print("[HEURISTIC] Detected multi-step prompt. Overriding category to MULTI.")
         category = "MULTI"
-    
-    print(f"📊 Analysis: score={score}, category={category}, label={complexity_label}")
+
+    # --- FIX 2: HEURISTIC OVERRIDE FOR ML/AI/VISION PROMPTS ---
+    # DeBERTa often labels ML pipeline, computer vision, and deep learning prompts
+    # as UTILITY or CHAT because it wasn't trained on these task patterns.
+    # These are always CODE or ANALYSIS tasks — never UTILITY.
+    import re
+    prompt_lower_check = user_prompt.lower()
+
+    # Expand common abbreviations for heuristic check
+    _abbr = {"ml": "machine learning", "dl": "deep learning", "cv": "computer vision",
+             "nlp": "natural language processing", "llm": "large language model",
+             "ai": "artificial intelligence", "cnn": "convolutional neural network"}
+    prompt_expanded = prompt_lower_check
+    for abbr, full in _abbr.items():
+        prompt_expanded = re.sub(rf"\b{abbr}\b", full, prompt_expanded)
+
+    ML_CRITICAL_SIGNALS = [
+        "machine learning", "deep learning", "neural network", "computer vision",
+        "natural language processing", "large language model", "artificial intelligence",
+        "convolutional neural network", "object detection", "image classification",
+        "image segmentation", "image detection", "ore detection", "ore image",
+        "multimodal", "multi-modal", "multimodel", "vision model",
+        "training pipeline", "inference pipeline", "data pipeline", "ml pipeline",
+        "feature engineering", "model training", "fine-tuning", "transfer learning",
+        "transformer model", "diffusion model", "generative model",
+        "yolo", "resnet", "vgg", "bert", "gpt", "stable diffusion",
+    ]
+    ml_signal_hits = sum(1 for kw in ML_CRITICAL_SIGNALS if kw in prompt_expanded)
+
+    if ml_signal_hits >= 1 and category in ("UTILITY", "CHAT", "EXTRACTION"):
+        # ML/AI tasks are CODE if they involve building/coding, else ANALYSIS
+        build_verbs = ["design", "build", "create", "implement", "develop",
+                       "code", "write", "train", "deploy", "architect"]
+        is_build_task = any(v in prompt_lower_check for v in build_verbs)
+        override_cat = "CODE" if is_build_task else "ANALYSIS"
+        print(f"[HEURISTIC] ML/AI prompt detected ({ml_signal_hits} signals). "
+              f"Overriding category: {category} → {override_cat}")
+        category = override_cat
+
+        # Also bump complexity: ML design tasks are never EASY
+        if complexity_label == "EASY":
+            complexity_label = "MEDIUM"
+            score = 5.5
+            print(f"[HEURISTIC] ML task complexity bumped: EASY → MEDIUM (score=5.5)")
+        if ml_signal_hits >= 2 and complexity_label == "MEDIUM":
+            complexity_label = "HARD"
+            score = 8.0
+            print(f"[HEURISTIC] ML design task complexity bumped: MEDIUM → HARD (score=8.0)")
+
+    print(f"Analysis: score={score}, category={category}, label={complexity_label}")
     
     # --- STEP 2-6: MICRO-ROUTING ---
     result = route_model(category, score, complexity_label)
@@ -253,18 +331,26 @@ def get_best_model(user_prompt, user_allowed_tier):
         top_provider = top_model.provider if top_model else "Unknown"
         top_tier = top_model.tier if top_model else 2
         
-        # Resolve fallbacks
+        # Resolve fallbacks — EXCLUDE the selected primary model to avoid retry
         fallbacks = []
         for c_name in candidate_names:
+            if c_name == selected_model_id:
+                continue  # BUG FIX: Don't include primary in fallback list
             c_model = db.query(AIModel).filter(AIModel.model_id == c_name).first()
             if c_model:
                 fallbacks.append({"model_id": c_model.model_id, "provider": c_model.provider})
-                
-        # If fallback list is empty, put gemini-flash-latest as universal fallback
-        if not fallbacks:
-            fallbacks.append({"model_id": "gemini-flash-latest", "provider": "Google"})
-            
-        print(f"🔄 Routing resolved with {len(fallbacks)-1} fallbacks.")
+
+        # Always ensure at least 2 safe generative fallbacks
+        SAFE_FALLBACKS = [
+            {"model_id": "gemini-1.5-flash", "provider": "Google"},
+            {"model_id": "gemini-2.0-flash", "provider": "Google"},
+        ]
+        fallback_ids = {f["model_id"] for f in fallbacks}
+        for sf in SAFE_FALLBACKS:
+            if sf["model_id"] not in fallback_ids and sf["model_id"] != selected_model_id:
+                fallbacks.append(sf)
+
+        print(f"🔄 Routing resolved with {len(fallbacks)} fallbacks.")
         return selected_model_id, top_provider, score, category, top_tier, fallbacks
     finally:
         db.close()

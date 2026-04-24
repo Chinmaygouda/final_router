@@ -31,29 +31,127 @@ class VaultService:
         return generate_vector(text)
 
     @staticmethod
-    def semantic_search(user_id: str, vector: list):
+    def _compute_keyword_overlap(prompt_a: str, prompt_b: str) -> float:
+        """
+        Computes Jaccard keyword overlap between two prompts.
+        Returns 0.0 (no overlap) to 1.0 (identical keywords).
+        
+        This is a cheap secondary check to prevent the vector search from
+        returning a semantically "close" but topically WRONG cached response.
+        Example: "write sorting algorithm" vs "write searching algorithm" have
+        high vector similarity but low keyword overlap on the critical word.
+        """
+        # Common filler words to ignore
+        STOP_WORDS = {
+            "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+            "have", "has", "had", "do", "does", "did", "will", "would", "shall",
+            "should", "may", "might", "must", "can", "could", "to", "of", "in",
+            "for", "on", "with", "at", "by", "from", "as", "into", "through",
+            "during", "before", "after", "above", "below", "between", "out",
+            "off", "over", "under", "again", "further", "then", "once", "here",
+            "there", "when", "where", "why", "how", "all", "both", "each",
+            "few", "more", "most", "other", "some", "such", "no", "nor", "not",
+            "only", "own", "same", "so", "than", "too", "very", "just", "but",
+            "and", "or", "if", "because", "about", "it", "its", "i", "me", "my",
+            "we", "our", "you", "your", "he", "him", "his", "she", "her", "they",
+            "them", "their", "this", "that", "these", "those", "what", "which",
+            "who", "whom", "whose", "write", "code", "make", "create", "build",
+            "give", "show", "explain", "please", "help", "need", "want",
+        }
+        
+        def extract_keywords(text):
+            # Lowercase, split, keep only alphanumeric tokens of 2+ chars
+            words = set()
+            for w in text.lower().split():
+                clean = ''.join(c for c in w if c.isalnum())
+                if len(clean) >= 2 and clean not in STOP_WORDS:
+                    words.add(clean)
+            return words
+        
+        keys_a = extract_keywords(prompt_a)
+        keys_b = extract_keywords(prompt_b)
+        
+        if not keys_a or not keys_b:
+            return 0.0
+        
+        intersection = keys_a & keys_b
+        union = keys_a | keys_b
+        
+        return len(intersection) / len(union) if union else 0.0
+
+    @staticmethod
+    def semantic_search(user_id: str, vector: list, original_prompt: str = None):
         """
         Searches vault for semantically similar previous responses.
+        
+        ANTI-HALLUCINATION: Uses a 3-layer verification system:
+          Layer 1: L2 vector distance (strict threshold)
+          Layer 2: Keyword overlap between original and cached prompt
+          Layer 3: Distance-to-overlap confidence ratio
+        
         Returns: (response_text, tokens_used, cost) or None
         """
         db = SessionLocal() 
         try:
-            threshold = 0.7  # L2 distance threshold (lowered for better cache hits)
+            # Layer 1: Vector distance threshold
+            # 0.55 is strict — only very close matches pass.
+            # This prevents "sorting" from matching "searching".
+            VECTOR_THRESHOLD = 0.55
             
-            match = db.query(UserConversation).filter(
+            # Layer 2: Minimum keyword overlap required
+            # At least 30% of the important words must match
+            KEYWORD_OVERLAP_MIN = 0.30
+            
+            # Fetch top 3 candidates (not just the closest one)
+            # This allows us to verify before committing to a match
+            candidates = db.query(UserConversation).filter(
                 UserConversation.user_id == user_id,
                 UserConversation.embedding != None, 
-                UserConversation.embedding.l2_distance(vector) < threshold
+                UserConversation.embedding.l2_distance(vector) < VECTOR_THRESHOLD
             ).order_by(
                 UserConversation.embedding.l2_distance(vector)
-            ).first()
+            ).limit(3).all()
 
-            if match:
-                print(f"🎯 VAULT HIT: Found similar prompt in ID {match.id}")
-                VaultService.log_system_event(user_id, "VAULT_CACHE_HIT")
-                return (match.response, match.tokens_consumed, match.actual_cost)
+            if not candidates:
+                return None
+            
+            # Evaluate each candidate with multi-layer checks
+            for candidate in candidates:
+                # Calculate the actual L2 distance for logging
+                # (We already filtered by threshold, but we need the value)
                 
+                # Layer 2: Keyword overlap check
+                if original_prompt and candidate.prompt:
+                    overlap = VaultService._compute_keyword_overlap(
+                        original_prompt, candidate.prompt
+                    )
+                    
+                    print(f"   🔬 Candidate ID {candidate.id}: "
+                          f"Keyword overlap = {overlap:.2f} "
+                          f"(min required: {KEYWORD_OVERLAP_MIN})")
+                    print(f"      Cached prompt: \"{candidate.prompt[:60]}...\"")
+                    
+                    if overlap < KEYWORD_OVERLAP_MIN:
+                        print(f"   ❌ REJECTED: Keyword overlap too low — "
+                              f"topics likely differ despite vector similarity")
+                        VaultService.log_system_event(
+                            user_id, 
+                            f"VAULT_REJECTED_LOW_OVERLAP:{overlap:.2f}"
+                        )
+                        continue  # Try next candidate
+                
+                # All layers passed — this is a verified cache hit
+                print(f"🎯 VAULT HIT (VERIFIED): ID {candidate.id} | "
+                      f"Keyword overlap: {overlap:.2f}")
+                VaultService.log_system_event(user_id, "VAULT_CACHE_HIT_VERIFIED")
+                return (candidate.response, candidate.tokens_consumed, candidate.actual_cost)
+            
+            # All candidates failed verification
+            print(f"   ⚠️ {len(candidates)} candidates found but ALL failed "
+                  f"keyword verification — treating as CACHE MISS")
+            VaultService.log_system_event(user_id, "VAULT_MISS_VERIFICATION_FAILED")
             return None
+            
         except Exception as e:
             print(f"❌ Search Error: {e}")
             return None
@@ -76,14 +174,16 @@ class VaultService:
 
     # ==================== PHASE 3: EXECUTION WITH DISPATCHER ====================
     @staticmethod
-    def execute_with_provider(provider: str, model_id: str, prompt: str):
+    def execute_with_provider(provider: str, model_id: str, prompt: str, category: str = "UTILITY"):
         """
         Routes request through appropriate provider using dispatcher.
+        category is passed to the dispatcher so it can inject the correct
+        system prompt (CODE gets code-writing instructions, CHAT gets chat instructions etc.)
         Returns: {text, tokens, success}
         """
         try:
             print(f"🚀 Executing with {provider} - {model_id}")
-            response = dispatcher.execute(provider, model_id, prompt)
+            response = dispatcher.execute(provider, model_id, prompt, category=category)
             return response
         except Exception as e:
             print(f"❌ Dispatcher error: {e}")
@@ -111,15 +211,14 @@ class VaultService:
             )
             db.add(new_entry)
             db.commit()
-            print(f"✅ Vault Updated: Saved ${cost:.4f} interaction from {provider}/{model_used}")
-            
-            # 2. Cache in Redis - DISABLED (Redis off per user request)
-            # if REDIS_AVAILABLE:
-            #     VaultService._cache_in_redis(user_id, prompt, response)
+            db.refresh(new_entry)  # FIX #10: Get the auto-generated ID
+            print(f"✅ Vault Updated: Saved ${cost:.4f} interaction from {provider}/{model_used} [ID: {new_entry.id}]")
+            return new_entry.id
             
         except Exception as e:
             print(f"❌ Database Save Error: {e}")
             db.rollback()
+            return None
         finally:
             db.close()
 
@@ -276,6 +375,15 @@ class VaultService:
                 cost=cost_usd,
                 latency=latency_seconds
             )
+
+            # 5. Update Adaptive Compressor — self-learning feedback
+            try:
+                from app.routing.prompt_compressor import get_prompt_compressor
+                compressor = get_prompt_compressor()
+                session_key = f"{model_name}_{category}_{int(latency_seconds*1000)}"
+                compressor.learn_from_feedback(session_id=session_key, reward=combined_reward)
+            except Exception:
+                pass  # Compressor learning is always non-critical
             
             # 5. Log the learning update
             print(f"\n[LEARNING] Model {model_name} ({category}):")

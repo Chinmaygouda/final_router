@@ -10,8 +10,8 @@ sys.path.insert(0, '.')
 
 from app.database_init import SessionLocal
 from app.models import AIModel
-from librarian import audit_models
-from auto_discovery import run_30_day_refresh
+from core.librarian import audit_models        # BUG #7 FIX: use absolute package imports
+from core.auto_discovery import run_30_day_refresh
 from sqlalchemy import desc
 from datetime import datetime
 

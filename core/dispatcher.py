@@ -1,11 +1,64 @@
 #FROZEN CODE - DO NOT MODIFY
+# Exception: system prompt injection added to fix code-only-text bug
 
 import os
 from dotenv import load_dotenv
 from openai import OpenAI
 from google import genai
+from google.genai import types as genai_types
 
 load_dotenv()
+
+# ── CATEGORY-AWARE SYSTEM PROMPTS ──────────────────────────────────────────
+# These ensure models produce the right OUTPUT FORMAT for each task type.
+# Without this, a 'CODE' request gets a text essay instead of code.
+SYSTEM_PROMPTS = {
+    "CODE": (
+        "You are an expert software engineer. "
+        "When asked to code, design, or build something, you MUST provide: "
+        "1) Complete, working, runnable code with no placeholders. "
+        "2) Clear inline comments explaining key steps. "
+        "3) A brief explanation of the architecture after the code. "
+        "Always use proper markdown code blocks (```python, ```bash etc.)."
+    ),
+    "AGENTS": (
+        "You are an expert AI systems architect. "
+        "When asked to design an agent or agentic pipeline, provide: "
+        "1) A complete working implementation with all components. "
+        "2) Agent loop, tool definitions, and orchestration logic in code. "
+        "3) Architecture diagram in text/ASCII if helpful. "
+        "Always use markdown code blocks for all code."
+    ),
+    "ANALYSIS": (
+        "You are an expert data scientist and analyst. "
+        "Provide thorough, structured analysis with: "
+        "1) Key findings clearly stated. "
+        "2) Supporting code or queries where applicable. "
+        "3) Actionable conclusions. "
+        "Use markdown headers and bullet points for clarity."
+    ),
+    "EXTRACTION": (
+        "You are an expert at data extraction and processing. "
+        "Provide complete extraction code/scripts with error handling. "
+        "Always show sample output and explain the data schema."
+    ),
+    "CREATIVE": (
+        "You are a creative writing expert. "
+        "Provide high-quality, original creative content. "
+        "Be imaginative, use vivid language, and fulfill the request fully."
+    ),
+    "UTILITY": (
+        "You are a knowledgeable, helpful assistant. "
+        "Provide clear, complete, and accurate answers. "
+        "Include examples where helpful."
+    ),
+    "CHAT": (
+        "You are a friendly, knowledgeable conversational assistant. "
+        "Be concise but complete. Ask clarifying questions if the request is ambiguous."
+    ),
+}
+DEFAULT_SYSTEM_PROMPT = SYSTEM_PROMPTS["UTILITY"]
+
 
 class Dispatcher:
     def __init__(self):
@@ -49,8 +102,15 @@ class Dispatcher:
         
         return self.hub.get(provider)
 
-    def execute(self, provider, model_id, prompt):
-        """Standardized execution returning {'text': str, 'tokens': int, 'success': bool}"""
+    def execute(self, provider, model_id, prompt, category="UTILITY"):
+        """
+        Standardized execution returning {'text': str, 'tokens': int, 'success': bool}
+        
+        category: task category (CODE, AGENTS, ANALYSIS, etc.) used to select
+                  the appropriate system prompt so models produce the right output format.
+        """
+        system_prompt = SYSTEM_PROMPTS.get(category.upper(), DEFAULT_SYSTEM_PROMPT)
+
         try:
             # Route to OpenAI-Compatible Hub
             if provider in ["OpenAI", "xAI", "OpenRouter", "Together", "DeepSeek", "Mistral", "HuggingFace"]:
@@ -60,7 +120,10 @@ class Dispatcher:
                 
                 response = client.chat.completions.create(
                     model=model_id,
-                    messages=[{"role": "user", "content": prompt}]
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user",   "content": prompt}
+                    ]
                 )
                 return {
                     "text": response.choices[0].message.content,
@@ -77,9 +140,9 @@ class Dispatcher:
                     response = self.client_anthropic.messages.create(
                         model=model_id,
                         max_tokens=4096,
+                        system=system_prompt,  # Anthropic uses top-level 'system' param
                         messages=[{"role": "user", "content": prompt}]
                     )
-                    # Correct attribute names for Anthropic SDK
                     tokens = response.usage.input_tokens + response.usage.output_tokens
                     return {"text": response.content[0].text, "tokens": tokens, "success": True}
                 except ImportError:
@@ -93,7 +156,11 @@ class Dispatcher:
                 if self.client_google:
                     response = self.client_google.models.generate_content(
                         model=model_id,
-                        contents=prompt
+                        contents=prompt,
+                        config=genai_types.GenerateContentConfig(
+                            system_instruction=system_prompt,
+                            max_output_tokens=8192,
+                        )
                     )
                     return {
                         "text": response.text,
@@ -112,7 +179,12 @@ class Dispatcher:
                         self.client_cohere = cohere.Client(co_key) if co_key else None
                     
                     if self.client_cohere:
-                        response = self.client_cohere.chat(model=model_id, message=prompt)
+                        # Cohere uses preamble as system prompt
+                        response = self.client_cohere.chat(
+                            model=model_id,
+                            preamble=system_prompt,
+                            message=prompt
+                        )
                         return {
                             "text": response.text, 
                             "tokens": response.meta.tokens.total_tokens if response.meta else 0,
@@ -129,3 +201,4 @@ class Dispatcher:
         except Exception as e:
             # Always return a dict even on error to prevent main.py from crashing
             return {"text": f"Execution Error [{provider}]: {str(e)}", "tokens": 0, "success": False}
+

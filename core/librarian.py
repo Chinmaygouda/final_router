@@ -26,19 +26,32 @@ CATEGORY_MAP = {
 }
 
 LIBRARIAN_PROMPT = f"""
-You are an AI Architect. Categorize these models.
+You are an AI Architect. Categorize these AI models for routing purposes.
 If a model is good at multiple things, list them separated by a SEMICOLON (;).
 USE ONLY THESE CATEGORIES: {", ".join(ALLOWED_CATEGORIES)}.
 
-Return ONLY comma-separated lines:
+For the tier field, you MUST use exactly one of these text values:
+  HIGH   = Premium/flagship model (GPT-4, Claude Opus, Gemini Pro, etc.)
+  MEDIUM = Standard/mid-range model (GPT-3.5, Claude Sonnet, Gemini Flash, etc.)
+  LOW    = Budget/small/fast model (small quantized models, lite variants, etc.)
+
+For complexity_min and complexity_max, use a float from 1.0 to 10.0.
+For cost_per_1m, use the approximate USD cost per 1 million tokens as a float.
+
+Return ONLY comma-separated lines with NO header row, NO explanation, NO markdown:
 model_id, provider, category_list, tier, complexity_min, complexity_max, cost_per_1m
-Example: gemini-2.0-pro, Google, CODE; ANALYSIS, HIGH, 8.5, 10.0, 1.25
+
+Examples:
+gemini-2.0-flash, Google, CODE; ANALYSIS, MEDIUM, 4.0, 8.0, 0.075
+claude-opus-4, Anthropic, CODE; ANALYSIS; AGENTS, HIGH, 7.0, 10.0, 15.0
+gpt-3.5-turbo, OpenAI, CHAT; UTILITY, LOW, 1.0, 5.0, 0.50
 """
 
 def audit_models(provider_name, model_list):
     """Processes models into the DB, allowing one model to occupy multiple rows/categories."""
-    # FIXED: Changed gemini-3-flash to gemini-1.5-flash
-    audit_candidates = ['gemini-2.5-flash','gemini-3-flash', 'gemini-1.5-flash']
+    # BUG #1 FIX: Use confirmed-working model names (verified via client.models.list()).
+    # Previous list used invalid/deprecated names that returned 404 from the generateContent API.
+    audit_candidates = ['gemini-2.0-flash', 'gemini-flash-latest', 'gemini-2.0-flash-lite']
     response = None
     
     print(f"📡 Requesting audit for {len(model_list)} models...")
@@ -132,44 +145,84 @@ def audit_models(provider_name, model_list):
 # ... (keep your assign_sub_tiers and reconstruct_database_layout as is)
 
 def assign_sub_tiers(db):
-    """Refreshes Tier 1-A vs 1-B rankings."""
-    tier1_list = db.query(AIModel).filter(AIModel.tier == 1, AIModel.is_active == True).order_by(desc(AIModel.cost_per_1m_tokens)).all()
-    seen = {}
-    rank = 0
-    for model in tier1_list:
-        if model.model_id not in seen:
-            seen[model.model_id] = "A" if rank < 3 else "B"
-            rank += 1
-        model.sub_tier = seen[model.model_id]
+    """Refreshes sub-tier rankings for ALL tiers (A = top half, B = bottom half).
+    
+    BUG #5 FIX: Previously only Tier 1 got sub_tiers. Tier 2 & 3 stayed None,
+    causing the router to misroute them into the tier1_b bucket.
+    """
+    for tier_num in [1, 2, 3]:
+        tier_list = db.query(AIModel).filter(
+            AIModel.tier == tier_num,
+            AIModel.is_active == True
+        ).order_by(desc(AIModel.cost_per_1m_tokens)).all()
+        
+        seen = {}
+        rank = 0
+        midpoint = max(1, len(tier_list) // 2)  # Top half = A, bottom half = B
+        
+        for model in tier_list:
+            if model.model_id not in seen:
+                # Tier 1: Top 3 = A (legacy behaviour preserved)
+                # Tier 2 & 3: Top half = A, bottom half = B
+                cutoff = 3 if tier_num == 1 else midpoint
+                seen[model.model_id] = "A" if rank < cutoff else "B"
+                rank += 1
+            model.sub_tier = seen[model.model_id]
     db.commit()
 
 def reconstruct_database_layout(db):
-    """Physically re-orders the DB by category priority and inserts spacers."""
-    active = db.query(AIModel).filter(AIModel.is_active == True, ~AIModel.model_id.startswith("---")).all()
-    inactive = db.query(AIModel).filter(AIModel.is_active == False, ~AIModel.model_id.startswith("---")).all()
+    """Physically re-orders the DB by category priority and inserts spacers.
     
-    new_layout = []
-    for cat in ALLOWED_CATEGORIES:
-        models = [m for m in active if m.category == cat]
-        if not models: continue
-        
-        # Sort by Tier then Complexity
-        sorted_models = sorted(models, key=lambda x: (x.tier, -x.complexity_min))
-        new_layout.extend(sorted_models)
+    BUG #4 FIX: Added try/except with rollback so a bad model row can't
+    silently wipe the entire table without recovery.
+    """
+    try:
+        active = db.query(AIModel).filter(
+            AIModel.is_active == True,
+            ~AIModel.model_id.startswith("---")
+        ).all()
+        inactive = db.query(AIModel).filter(
+            AIModel.is_active == False,
+            ~AIModel.model_id.startswith("---")
+        ).all()
 
-        # Category Spacer
-        new_layout.append(AIModel(
-            model_id=f"--- {cat} END ---", provider="---", category=cat, tier=0,
-            complexity_min=0.0, complexity_max=0.0, cost_per_1m_tokens=0.0, is_active=False
-        ))
+        new_layout = []
+        for cat in ALLOWED_CATEGORIES:
+            cat_models = [m for m in active if m.category == cat]
+            if not cat_models:
+                continue
 
-    new_layout.extend(inactive)
-    db.query(AIModel).delete()
-    for item in new_layout:
-        db.add(AIModel(
-            model_id=item.model_id, provider=item.provider, category=item.category,
-            tier=item.tier, sub_tier=item.sub_tier, complexity_min=item.complexity_min,
-            complexity_max=item.complexity_max, cost_per_1m_tokens=item.cost_per_1m_tokens,
-            is_active=item.is_active
-        ))
-    db.commit()
+            # Sort by Tier then Complexity descending
+            sorted_models = sorted(cat_models, key=lambda x: (x.tier, -x.complexity_min))
+            new_layout.extend(sorted_models)
+
+            # Category Spacer (visual separator, is_active=False so router skips it)
+            new_layout.append(AIModel(
+                model_id=f"--- {cat} END ---", provider="---", category=cat, tier=0,
+                complexity_min=0.0, complexity_max=0.0, cost_per_1m_tokens=0.0, is_active=False
+            ))
+
+        new_layout.extend(inactive)
+
+        # Snapshot count before delete for safety check
+        pre_delete_count = len([m for m in new_layout if m.is_active and not m.model_id.startswith("---")])
+
+        db.query(AIModel).delete()
+        for item in new_layout:
+            db.add(AIModel(
+                model_id=item.model_id,
+                provider=item.provider,
+                category=item.category,
+                tier=item.tier,
+                sub_tier=item.sub_tier,
+                complexity_min=item.complexity_min,
+                complexity_max=item.complexity_max,
+                cost_per_1m_tokens=item.cost_per_1m_tokens,
+                is_active=item.is_active
+            ))
+        db.commit()
+        print(f"   ✅ Layout reconstructed: {pre_delete_count} active models re-inserted.")
+    except Exception as e:
+        print(f"   ❌ reconstruct_database_layout FAILED: {e} — rolling back to preserve data.")
+        db.rollback()
+        raise

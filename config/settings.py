@@ -8,7 +8,7 @@ Configuration settings for the router system.
 CONFIDENCE_THRESHOLD = 0.5
 
 # Number of top models to keep as candidates
-TOP_K = 2
+TOP_K = 5
 
 # Tier rules based on complexity level
 # Determines which tiers are allowed for each complexity level

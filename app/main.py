@@ -1,10 +1,13 @@
 import os
 import sys
 import io
-from fastapi import FastAPI, HTTPException
+import time
+from collections import defaultdict
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from datetime import datetime
+from sqlalchemy import func
 
 # Prevent Windows console from crashing on emoji prints
 if sys.platform == "win32":
@@ -21,6 +24,8 @@ from app.embedding_engine import generate_vector
 from app.models import UserConversation, AIModel
 from database.session import SessionLocal
 from core.auto_discovery import run_auto_update
+from app.routing.prompt_compressor import get_prompt_compressor
+from app.routing.circuit_breaker import get_circuit_breaker
 
 load_dotenv()
 
@@ -66,6 +71,21 @@ def _seed_models_if_empty():
 # 1. Initialize FastAPI app
 app = FastAPI(title="Unified Router Gateway - Caching First + Intelligent Routing")
 
+# --- RATE LIMITING ---
+_rate_limit_store = defaultdict(list)  # {user_id: [timestamp, ...]}
+RATE_LIMIT_MAX = 30  # Max requests per minute per user
+RATE_LIMIT_WINDOW = 60  # Window in seconds
+
+def _check_rate_limit(user_id: str) -> bool:
+    """Returns True if user is within rate limit, False if exceeded."""
+    now = time.time()
+    # Clean old entries
+    _rate_limit_store[user_id] = [t for t in _rate_limit_store[user_id] if now - t < RATE_LIMIT_WINDOW]
+    if len(_rate_limit_store[user_id]) >= RATE_LIMIT_MAX:
+        return False
+    _rate_limit_store[user_id].append(now)
+    return True
+
 # --- STARTUP EVENT ---
 @app.on_event("startup")
 async def startup_event():
@@ -91,9 +111,6 @@ class QueryRequest(BaseModel):
     user_id: str      # Required for privacy separation
     prompt: str       # The user's question
     user_tier: int = 1  # Optional: 1 (Premium), 2 (Standard), 3 (Budget)
-    modality: str = "TEXT"  # TEXT, IMAGE, VIDEO, AUDIO, MULTIMODAL
-    image_data: str = None  # Optional Base64 image
-    audio_data: str = None  # Optional Base64 audio
 
 class QueryResponse(BaseModel):
     status: str
@@ -120,6 +137,10 @@ async def ask_unified(request: QueryRequest):
     print(f"🚀 UNIFIED REQUEST | User: {request.user_id} | Tier: {request.user_tier}")
     print(f"📝 Prompt: {request.prompt[:60]}...")
 
+    # --- FIX #9: RATE LIMITING ---
+    if not _check_rate_limit(request.user_id):
+        raise HTTPException(status_code=429, detail=f"Rate limit exceeded. Max {RATE_LIMIT_MAX} requests per minute.")
+
     try:
         # ======================================================
         # PHASE 1: SEMANTIC VAULT LOOKUP (Check Cache)
@@ -130,7 +151,9 @@ async def ask_unified(request: QueryRequest):
         if not query_vector:
             raise Exception("Failed to generate embedding vector")
 
-        cache_result = VaultService.semantic_search(request.user_id, query_vector)
+        cache_result = VaultService.semantic_search(
+            request.user_id, query_vector, original_prompt=request.prompt
+        )
         
         if cache_result:
             response_text, tokens_used, cost = cache_result
@@ -166,41 +189,65 @@ async def ask_unified(request: QueryRequest):
         # PHASE 3: EXECUTION (Call Selected Provider with Fallback)
         # ======================================================
         print("\n[PHASE 3] 🚀 Executing with selected model...")
-        
+
+        # FIX #5: Compress prompt before sending to AI (30-50% token savings)
+        compressor = get_prompt_compressor()
+        compressed_prompt, compression_metrics = compressor.compress(request.prompt, category)
+
+        orig_preview   = request.prompt[:200].replace('\n', ' ').strip()
+        comp_preview   = compressed_prompt[:200].replace('\n', ' ').strip()
+        print(f"\n[COMPRESSION] ✂️  Token Reduction:")
+        print(f"  📋 ORIGINAL  ({compression_metrics['original_words']}w):  {orig_preview}{'...' if len(request.prompt) > 200 else ''}")
+        print(f"  📦 COMPRESSED({compression_metrics['compressed_words']}w):  {comp_preview}{'...' if len(compressed_prompt) > 200 else ''}")
+        print(f"  💾 Saved: {compression_metrics['savings_percent']}% | {compression_metrics['original_words'] - compression_metrics['compressed_words']} words removed")
+
         execution_success = False
         real_ai_response = ""
         real_tokens_used = 0
         cost = 0.0
+        execution_start_time = time.time()  # FIX #3: Track latency
         
         # We will try the primary model, and if it fails, try up to 2 fallbacks (max 3 total attempts)
         models_to_try = [{"model_id": model_id, "provider": provider}] + fallbacks[:2]
         
+        # FIX #8: Get circuit breaker for tracking model health
+        circuit_breaker = get_circuit_breaker()
+
         for attempt_idx, candidate in enumerate(models_to_try):
             c_provider = candidate["provider"]
             c_model = candidate["model_id"]
-            
+
+            # FIX #8: Skip if circuit breaker has tripped this model
+            if circuit_breaker.breakers[c_model].is_open():
+                print(f"[CIRCUIT] ⚡ {c_model} circuit OPEN — skipping")
+                continue
+
             if attempt_idx > 0:
                 print(f"\n[FALLBACK {attempt_idx}] 🔄 Attempting alternative model: {c_provider}/{c_model}")
-            
+
             response_data = VaultService.execute_with_provider(
-                c_provider, c_model, request.prompt
+                c_provider, c_model, compressed_prompt, category=category
             )
-            
+
             if response_data and response_data.get("success") is True:
+                circuit_breaker.record_success(c_model)  # FIX #8: reset failure count
                 real_ai_response = response_data["text"]
                 real_tokens_used = response_data.get("tokens", 0)
                 cost = VaultService._calculate_cost(c_provider, c_model, real_tokens_used)
-                
+
                 print(f"✅ Generated from {c_model} | Tokens: {real_tokens_used} | Cost: ${cost:.4f}")
-                
+
                 # Update our primary variables so it saves in DB correctly
                 model_id = c_model
                 provider = c_provider
                 execution_success = True
+                execution_latency = time.time() - execution_start_time  # FIX #3
+                print(f"⏱️  Latency: {execution_latency:.2f}s")
                 break
             else:
                 err_msg = response_data.get('text', 'Unknown Error') if response_data else 'Invalid Empty Response'
                 print(f"❌ Execution failed for {c_provider}/{c_model}: {err_msg}")
+                circuit_breaker.record_failure(c_model)  # FIX #8: track failure
                 # Loop naturally continues to next fallback candidate
         if not execution_success:
             final_err = f"System attempted to route your request, but all AI providers failed or exhausted their quotas.\n\nModels Attempted: {', '.join([m['model_id'] for m in models_to_try])}\n\nLast Exact Error: {err_msg}"
@@ -225,7 +272,7 @@ async def ask_unified(request: QueryRequest):
         # PHASE 4: STORAGE (Save to Vault + Redis)
         # ======================================================
         print("\n[PHASE 4] 💾 Storing in vault...")
-        VaultService.save_to_vault(
+        vault_id = VaultService.save_to_vault(
             request.user_id,
             request.prompt,
             real_ai_response,
@@ -236,9 +283,21 @@ async def ask_unified(request: QueryRequest):
             provider
         )
 
-        # Check for topic changes in session (disabled - Redis off)
-        # if REDIS_AVAILABLE:
-        #     VaultService.check_topic_change(request.user_id, request.prompt)
+        # ======================================================
+        # PHASE 5: REWARD & LEARNING (FIX #1: Wire up reward loop)
+        # ======================================================
+        print("\n[PHASE 5] 🧠 Updating learning systems...")
+        try:
+            VaultService.calculate_and_update_reward(
+                model_name=model_id,
+                category=category,
+                response=real_ai_response,
+                tokens_consumed=real_tokens_used,
+                cost_usd=cost,
+                latency_seconds=execution_latency
+            )
+        except Exception as e:
+            print(f"⚠️ Learning update warning (non-fatal): {e}")
 
         print("="*70 + "\n")
 
@@ -255,9 +314,11 @@ async def ask_unified(request: QueryRequest):
                     "category": category,
                     "tier": tier,
                     "tokens_consumed": real_tokens_used,
-                    "cost_usd": round(cost, 4)
+                    "cost_usd": round(cost, 4),
+                    "latency_seconds": round(execution_latency, 2)
                 }
-            }
+            },
+            vault_id=str(vault_id) if vault_id else None  # FIX #10
         )
 
     except Exception as e:
@@ -276,20 +337,20 @@ async def get_vault_stats(user_id: str):
             UserConversation.user_id == user_id
         ).count()
         
-        total_tokens = db.query(UserConversation).filter(
+        # FIX #4: Use func.sum() instead of .count() for actual totals
+        total_tokens = db.query(func.sum(UserConversation.tokens_consumed)).filter(
             UserConversation.user_id == user_id
-        ).count()
+        ).scalar() or 0
         
-        total_cost = db.query(UserConversation).filter(
+        total_cost = db.query(func.sum(UserConversation.actual_cost)).filter(
             UserConversation.user_id == user_id
-        ).count()
+        ).scalar() or 0.0
         
         return {
             "user_id": user_id,
             "total_queries": total_queries,
-            "vault_entries": total_tokens,
-            "estimated_tokens": total_tokens * 100,  # Rough estimate
-            "estimated_cost": f"${total_cost * 0.01:.2f}"
+            "total_tokens": int(total_tokens),
+            "total_cost_usd": f"${float(total_cost):.4f}"
         }
     finally:
         db.close()
