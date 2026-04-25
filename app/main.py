@@ -1,9 +1,12 @@
 import os
 import sys
 import io
+import json
 import time
 from collections import defaultdict
+from typing import Optional
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from datetime import datetime
@@ -21,11 +24,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from app.database_init import initialize_v2_db
 from app.vault_service import VaultService
 from app.embedding_engine import generate_vector
-from app.models import UserConversation, AIModel
-from database.session import SessionLocal
+from app.models import UserConversation, AIModel, UserMemory
+from app.database_init import SessionLocal          # Single DB engine — no split brain
 from core.auto_discovery import run_auto_update
+from core.dispatcher import get_dispatcher           # Use singleton, not module-level instance
 from app.routing.prompt_compressor import get_prompt_compressor
 from app.routing.circuit_breaker import get_circuit_breaker
+from app.guardrails import GuardrailsChecker         # Feature 7
+from app.memory_service import MemoryService         # Feature 12
+from config.settings import NON_TEXT_KEYWORDS, SAFE_FALLBACK_MODELS
 
 load_dotenv()
 
@@ -89,76 +96,108 @@ def _check_rate_limit(user_id: str) -> bool:
 # --- STARTUP EVENT ---
 @app.on_event("startup")
 async def startup_event():
-    print("🚀 App is starting up...")
-    print("📊 Redis: Disabled (PostgreSQL only)")
+    import asyncio
+    print("App starting up...")
+    print("Redis: Disabled (PostgreSQL only)")
     initialize_v2_db()
-    print("✅ Database check complete.")
-    
+    print("Database check complete.")
+
     # Try to seed with basic models if empty
     _seed_models_if_empty()
-    
-    # Run auto-update librarian (checks if 30+ days or API keys changed)
-    try:
-        print("\n📚 Running Auto-Update Librarian...")
-        run_auto_update()
-    except Exception as e:
-        print(f"⚠️ Librarian error (non-fatal): {e}")
-    
-    print("🎯 System Mode: CACHING FIRST (Vault → Router → Dispatcher → Store)")
 
-# 3. Define the Request Data
+    # Run auto-update librarian in a BACKGROUND THREAD.
+    # run_auto_update() makes synchronous network calls (Google, Anthropic APIs).
+    # Calling it directly inside async def blocks the entire FastAPI event loop —
+    # no endpoint (not even /health) can respond until it finishes.
+    # asyncio.to_thread() dispatches it to a thread pool so the server stays responsive.
+    async def _run_librarian():
+        try:
+            print("\nRunning Auto-Update Librarian (background thread)...")
+            await asyncio.to_thread(run_auto_update)
+            print("Librarian complete.")
+        except Exception as e:
+            print(f"Librarian error (non-fatal): {e}")
+
+    asyncio.create_task(_run_librarian())
+    print("System Mode: CACHING FIRST (Vault -> Router -> Dispatcher -> Store)")
+    print("Server ready - all endpoints accepting requests.\n")
+
+# ==================== REQUEST / RESPONSE MODELS ====================
+
 class QueryRequest(BaseModel):
-    user_id: str      # Required for privacy separation
-    prompt: str       # The user's question
-    user_tier: int = 1  # Optional: 1 (Premium), 2 (Standard), 3 (Budget)
+    user_id: str                        # Required for privacy separation
+    prompt: str                         # The user's question
+    user_tier: int = 1                  # 1=Premium, 2=Standard, 3=Budget
+    # Feature 2: Multi-Turn Conversation History
+    session_id: Optional[str] = None    # Links messages in a conversation
+    max_history_turns: int = 5          # How many past turns to include
+    # Feature 6: Multi-Modal Input
+    image_base64: Optional[str] = None  # Base64-encoded image (e.g. ore image)
+    image_url: Optional[str] = None     # Or a public image URL
 
 class QueryResponse(BaseModel):
     status: str
-    source: str  # "VAULT_CACHE", "AI_GENERATION", or "ERROR"
+    source: str       # "VAULT_CACHE", "AI_GENERATION", or "ERROR"
     data: dict
-    vault_id: str = None  # ID for later feedback
+    vault_id: str = None
 
 class FeedbackRequest(BaseModel):
-    vault_id: str  # Which conversation to update
-    feedback: float  # +1.0 (thumbs up) or -1.0 (thumbs down)
-    comments: str = None  # Optional user feedback
+    vault_id: str
+    feedback: float   # +1.0 (thumbs up) or -1.0 (thumbs down)
+    comments: str = None
 
 # ==================== MAIN UNIFIED ENDPOINT ====================
 @app.post("/ask", response_model=QueryResponse)
 async def ask_unified(request: QueryRequest):
     """
     Unified endpoint implementing CACHING FIRST workflow:
-    1. Check semantic vault for cached response
-    2. If miss, use intelligent router to select best model
-    3. Execute with dispatcher
-    4. Store result in vault + Redis cache
+    1. Guardrails: safety + PII check (Feature 7)
+    2. Check semantic vault for cached response
+    3. Build conversation history context (Feature 2)
+    4. Prepend user memory context (Feature 12)
+    5. Intelligent routing → select best model
+    6. Execute with dispatcher (supports images - Feature 6)
+    7. Store result + extract new memories
     """
     print("\n" + "="*70)
     print(f"🚀 UNIFIED REQUEST | User: {request.user_id} | Tier: {request.user_tier}")
     print(f"📝 Prompt: {request.prompt[:60]}...")
+    if request.image_base64 or request.image_url:
+        print("🖼️  Image detected — Multi-Modal request (Feature 6)")
+    if request.session_id:
+        print(f"💬 Session: {request.session_id} (Multi-Turn - Feature 2)")
 
-    # --- FIX #9: RATE LIMITING ---
+    # --- RATE LIMITING ---
     if not _check_rate_limit(request.user_id):
         raise HTTPException(status_code=429, detail=f"Rate limit exceeded. Max {RATE_LIMIT_MAX} requests per minute.")
+
+    # ── FEATURE 7: GUARDRAILS ─────────────────────────────────────────────
+    print("\n[GUARDRAILS] 🛡️  Running safety checks...")
+    safety = GuardrailsChecker.check(request.prompt)
+    if safety.blocked:
+        print(f"[GUARDRAILS] ❌ BLOCKED: {safety.reason}")
+        raise HTTPException(status_code=400, detail=f"Request blocked by safety guardrails: {safety.reason}")
+    if safety.pii_detected:
+        print(f"[GUARDRAILS] ⚠️  PII detected and redacted: {safety.pii_types}")
+    safe_prompt = safety.redacted_prompt   # Use redacted version throughout
 
     try:
         # ======================================================
         # PHASE 1: SEMANTIC VAULT LOOKUP (Check Cache)
         # ======================================================
         print("\n[PHASE 1] 🔍 Checking semantic vault...")
-        query_vector = VaultService.get_embedding(request.prompt)
-        
+        query_vector = VaultService.get_embedding(safe_prompt)
+
         if not query_vector:
             raise Exception("Failed to generate embedding vector")
 
         cache_result = VaultService.semantic_search(
-            request.user_id, query_vector, original_prompt=request.prompt
+            request.user_id, query_vector, original_prompt=safe_prompt
         )
-        
+
         if cache_result:
             response_text, tokens_used, cost = cache_result
             print(f"✅ CACHE HIT | Saved tokens: {tokens_used} | Cost averted: ${cost:.4f}")
-            
             return QueryResponse(
                 status="Success",
                 source="VAULT_CACHE",
@@ -174,12 +213,54 @@ async def ask_unified(request: QueryRequest):
                 }
             )
 
+        # ── FEATURE 2: CONVERSATION HISTORY ──────────────────────
+        history_context = ""
+        if request.session_id:
+            db = SessionLocal()
+            try:
+                history_turns = (
+                    db.query(UserConversation)
+                    .filter(
+                        UserConversation.user_id == request.user_id,
+                        UserConversation.session_id == request.session_id
+                    )
+                    .order_by(UserConversation.created_at.desc())
+                    .limit(request.max_history_turns)
+                    .all()
+                )
+                if history_turns:
+                    turns_text = []
+                    for turn in reversed(history_turns):
+                        turns_text.append(f"User: {turn.prompt}")
+                        turns_text.append(f"Assistant: {turn.response[:500]}")
+                    history_context = "[CONVERSATION HISTORY]\n" + "\n".join(turns_text) + "\n[END HISTORY]\n\n"
+                    print(f"[HISTORY] 💬 Loaded {len(history_turns)} previous turn(s)")
+            finally:
+                db.close()
+
+        # ── FEATURE 12: PERSISTENT USER MEMORY ───────────────────
+        memory_context = ""
+        db = SessionLocal()
+        try:
+            memories = MemoryService.get_memories(request.user_id, db)
+            if memories:
+                memory_context = MemoryService.build_memory_context(memories)
+                print(f"[MEMORY] 🧠 Loaded {len(memories)} user memories")
+        finally:
+            db.close()
+
+        # Combine all context into final enriched prompt
+        enriched_prompt = f"{memory_context}{history_context}{safe_prompt}"
+
         # ======================================================
         # PHASE 2: INTELLIGENT ROUTING (Select Best Model)
         # ======================================================
-        print("\n[PHASE 2] 🧭 VAULT MISS - Intelligent routing...")
+        print("\n[PHASE 2] Intelligent routing...")
+        # Route on the raw user question ONLY — not enriched_prompt.
+        # If we passed enriched_prompt, history text like 'AI systems' would trigger
+        # the ML heuristic and misclassify 'What is my name?' as CODE.
         model_id, provider, score, category, tier, fallbacks = VaultService.get_best_provider_and_model(
-            request.prompt, 
+            safe_prompt,
             request.user_tier
         )
         print(f"🎯 Routed to {provider}/{model_id}")
@@ -190,26 +271,61 @@ async def ask_unified(request: QueryRequest):
         # ======================================================
         print("\n[PHASE 3] 🚀 Executing with selected model...")
 
-        # FIX #5: Compress prompt before sending to AI (30-50% token savings)
+        # Compress only the USER's new message (not history/memory — they must be preserved intact)
         compressor = get_prompt_compressor()
-        compressed_prompt, compression_metrics = compressor.compress(request.prompt, category)
+        compressed_user_msg, compression_metrics = compressor.compress(request.prompt, category)
 
-        orig_preview   = request.prompt[:200].replace('\n', ' ').strip()
-        comp_preview   = compressed_prompt[:200].replace('\n', ' ').strip()
-        print(f"\n[COMPRESSION] ✂️  Token Reduction:")
-        print(f"  📋 ORIGINAL  ({compression_metrics['original_words']}w):  {orig_preview}{'...' if len(request.prompt) > 200 else ''}")
-        print(f"  📦 COMPRESSED({compression_metrics['compressed_words']}w):  {comp_preview}{'...' if len(compressed_prompt) > 200 else ''}")
-        print(f"  💾 Saved: {compression_metrics['savings_percent']}% | {compression_metrics['original_words'] - compression_metrics['compressed_words']} words removed")
+        # Re-attach history + memory AFTER compression so context always reaches the AI
+        compressed_prompt = f"{memory_context}{history_context}{compressed_user_msg}"
+
+        orig_preview = request.prompt[:200].replace('\n', ' ').strip()
+        comp_preview = compressed_user_msg[:200].replace('\n', ' ').strip()
+        print(f"\n[COMPRESSION] Token Reduction (user message only):")
+        print(f"  ORIGINAL  ({compression_metrics['original_words']}w): {orig_preview}{'...' if len(request.prompt) > 200 else ''}")
+        print(f"  COMPRESSED({compression_metrics['compressed_words']}w): {comp_preview}{'...' if len(compressed_user_msg) > 200 else ''}")
+        print(f"  Saved: {compression_metrics['savings_percent']}% | History/Memory context preserved and prepended")
 
         execution_success = False
         real_ai_response = ""
         real_tokens_used = 0
         cost = 0.0
-        execution_start_time = time.time()  # FIX #3: Track latency
-        
-        # We will try the primary model, and if it fails, try up to 2 fallbacks (max 3 total attempts)
-        models_to_try = [{"model_id": model_id, "provider": provider}] + fallbacks[:2]
-        
+        execution_start_time = time.time()
+
+        # ── CASCADING FALLBACK CHAIN ─────────────────────────────────
+        # Rule 1: Try primary model → all same-category fallbacks (no cap)
+        # Rule 2: If all same-category fail → try best models from ALL other categories
+        # Rule 3: Last resort → hardcoded safe models guaranteed to produce text
+        # Non-text models (veo, lyria, imagen, etc.) are pre-filtered in router.py
+
+        # Build same-category candidates (all fallbacks, not just 2)
+        same_category_candidates = [{"model_id": model_id, "provider": provider}] + fallbacks
+
+        # Build cross-category candidates from DB — uses NON_TEXT_KEYWORDS from config/settings.py
+        same_ids = {m["model_id"] for m in same_category_candidates}
+        try:
+            db_cross = SessionLocal()
+            all_db_models = db_cross.query(AIModel).filter(
+                AIModel.is_active == True,
+                AIModel.category != category
+            ).all()
+            db_cross.close()
+            cross_category_candidates = []
+            for m in all_db_models:
+                m_lower = m.model_id.lower()
+                if any(kw in m_lower for kw in NON_TEXT_KEYWORDS):
+                    continue
+                if m.model_id in same_ids:
+                    continue
+                cross_category_candidates.append({"model_id": m.model_id, "provider": m.provider})
+        except Exception:
+            cross_category_candidates = []
+
+        # Last-resort fallbacks from config/settings.py (SAFE_FALLBACK_MODELS)
+        all_tried_ids = same_ids | {m["model_id"] for m in cross_category_candidates}
+        last_resort_candidates = [m for m in SAFE_FALLBACK_MODELS if m["model_id"] not in all_tried_ids]
+
+        models_to_try = same_category_candidates + cross_category_candidates + last_resort_candidates
+
         # FIX #8: Get circuit breaker for tracking model health
         circuit_breaker = get_circuit_breaker()
 
@@ -219,38 +335,48 @@ async def ask_unified(request: QueryRequest):
 
             # FIX #8: Skip if circuit breaker has tripped this model
             if circuit_breaker.breakers[c_model].is_open():
-                print(f"[CIRCUIT] ⚡ {c_model} circuit OPEN — skipping")
+                print(f"[CIRCUIT] {c_model} circuit OPEN — skipping")
                 continue
 
-            if attempt_idx > 0:
-                print(f"\n[FALLBACK {attempt_idx}] 🔄 Attempting alternative model: {c_provider}/{c_model}")
+            if attempt_idx == 0:
+                print(f"[ATTEMPT] Primary: {c_provider}/{c_model}")
+            elif attempt_idx < len(same_category_candidates):
+                print(f"\n[FALLBACK {attempt_idx}] Same-category: {c_provider}/{c_model}")
+            elif attempt_idx < len(same_category_candidates) + len(cross_category_candidates):
+                print(f"\n[FALLBACK {attempt_idx}] Cross-category: {c_provider}/{c_model}")
+            else:
+                print(f"\n[FALLBACK {attempt_idx}] Last resort: {c_provider}/{c_model}")
 
             response_data = VaultService.execute_with_provider(
-                c_provider, c_model, compressed_prompt, category=category
+                c_provider, c_model, compressed_prompt, category=category,
+                image_base64=request.image_base64,
+                image_url=request.image_url
             )
 
             if response_data and response_data.get("success") is True:
-                circuit_breaker.record_success(c_model)  # FIX #8: reset failure count
+                circuit_breaker.record_success(c_model)
                 real_ai_response = response_data["text"]
                 real_tokens_used = response_data.get("tokens", 0)
                 cost = VaultService._calculate_cost(c_provider, c_model, real_tokens_used)
-
-                print(f"✅ Generated from {c_model} | Tokens: {real_tokens_used} | Cost: ${cost:.4f}")
-
-                # Update our primary variables so it saves in DB correctly
+                print(f"SUCCESS: {c_model} | Tokens: {real_tokens_used} | Cost: ${cost:.4f}")
                 model_id = c_model
                 provider = c_provider
                 execution_success = True
-                execution_latency = time.time() - execution_start_time  # FIX #3
-                print(f"⏱️  Latency: {execution_latency:.2f}s")
+                execution_latency = time.time() - execution_start_time
+                print(f"Latency: {execution_latency:.2f}s")
                 break
             else:
                 err_msg = response_data.get('text', 'Unknown Error') if response_data else 'Invalid Empty Response'
-                print(f"❌ Execution failed for {c_provider}/{c_model}: {err_msg}")
-                circuit_breaker.record_failure(c_model)  # FIX #8: track failure
-                # Loop naturally continues to next fallback candidate
+                print(f"FAILED: {c_provider}/{c_model}: {err_msg[:80]}")
+                circuit_breaker.record_failure(c_model)
+
         if not execution_success:
-            final_err = f"System attempted to route your request, but all AI providers failed or exhausted their quotas.\n\nModels Attempted: {', '.join([m['model_id'] for m in models_to_try])}\n\nLast Exact Error: {err_msg}"
+            final_err = (
+                f"System attempted to route your request, but all AI providers failed or exhausted their quotas.\n\n"
+                f"Models Attempted: {', '.join([m['model_id'] for m in models_to_try])}\n\n"
+                f"Last Exact Error: {err_msg}"
+            )
+
             return QueryResponse(
                 status="Error - Provider Failure",
                 source="FALLBACK_EXHAUSTED",
@@ -269,7 +395,7 @@ async def ask_unified(request: QueryRequest):
                 }
             )
         # ======================================================
-        # PHASE 4: STORAGE (Save to Vault + Redis)
+        # PHASE 4: STORAGE (Save to Vault)
         # ======================================================
         print("\n[PHASE 4] 💾 Storing in vault...")
         vault_id = VaultService.save_to_vault(
@@ -280,11 +406,12 @@ async def ask_unified(request: QueryRequest):
             query_vector,
             cost,
             model_id,
-            provider
+            provider,
+            session_id=request.session_id,  # Feature 2: track conversation session
         )
 
         # ======================================================
-        # PHASE 5: REWARD & LEARNING (FIX #1: Wire up reward loop)
+        # PHASE 5: REWARD & LEARNING + MEMORY EXTRACTION
         # ======================================================
         print("\n[PHASE 5] 🧠 Updating learning systems...")
         try:
@@ -298,6 +425,19 @@ async def ask_unified(request: QueryRequest):
             )
         except Exception as e:
             print(f"⚠️ Learning update warning (non-fatal): {e}")
+
+        # Feature 12: Extract and persist user memories (non-fatal)
+        try:
+            db = SessionLocal()
+            MemoryService.save_memories(
+                request.user_id, db,
+                prompt=request.prompt,
+                response=real_ai_response,
+                conversation_id=vault_id
+            )
+            db.close()
+        except Exception as e:
+            print(f"⚠️ Memory extraction warning (non-fatal): {e}")
 
         print("="*70 + "\n")
 
@@ -424,10 +564,133 @@ async def health():
     return {
         "status": "OK",
         "redis_available": False,
-        "mode": "PostgreSQL Only (Redis Disabled)"
+        "mode": "PostgreSQL Only (Redis Disabled)",
+        "features": ["streaming", "conversation_history", "multi_modal", "guardrails", "user_memory", "operator_prompts"]
     }
 
+# ==================== FEATURE 1: STREAMING ENDPOINT ====================
+@app.post("/ask/stream")
+async def ask_stream(request: QueryRequest):
+    """
+    Streaming endpoint — returns tokens word-by-word via Server-Sent Events (SSE).
+    The client receives the response as it is generated instead of waiting 30+ seconds.
+
+    Usage with JavaScript:
+        const source = new EventSource('/ask/stream');
+        source.onmessage = (e) => { if (e.data !== '[DONE]') display(e.data); };
+    """
+    if not _check_rate_limit(request.user_id):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded.")
+
+    # Feature 7: Guardrails
+    safety = GuardrailsChecker.check(request.prompt)
+    if safety.blocked:
+        raise HTTPException(status_code=400, detail=f"Blocked: {safety.reason}")
+    safe_prompt = safety.redacted_prompt
+
+    # Feature 2: Conversation History
+    history_context = ""
+    if request.session_id:
+        db = SessionLocal()
+        try:
+            turns = (
+                db.query(UserConversation)
+                .filter(UserConversation.user_id == request.user_id,
+                        UserConversation.session_id == request.session_id)
+                .order_by(UserConversation.created_at.desc())
+                .limit(request.max_history_turns).all()
+            )
+            if turns:
+                lines = []
+                for t in reversed(turns):
+                    lines += [f"User: {t.prompt}", f"Assistant: {t.response[:500]}"]
+                history_context = "[CONVERSATION HISTORY]\n" + "\n".join(lines) + "\n[END HISTORY]\n\n"
+        finally:
+            db.close()
+
+    # Feature 12: Memory
+    memory_context = ""
+    db = SessionLocal()
+    try:
+        memories = MemoryService.get_memories(request.user_id, db)
+        if memories:
+            memory_context = MemoryService.build_memory_context(memories)
+    finally:
+        db.close()
+
+    enriched_prompt = f"{memory_context}{history_context}{safe_prompt}"
+
+    # Route on the actual user question ONLY — not enriched_prompt.
+    # Prevents ML heuristic from misclassifying history context words as CODE.
+    model_id, provider, score, category, tier, fallbacks = VaultService.get_best_provider_and_model(
+        safe_prompt, request.user_tier
+    )
+    print(f"[STREAM] {provider}/{model_id} | Category: {category}")
+
+    async def event_generator():
+        full_response = []
+        try:
+            async for token in get_dispatcher().execute_stream(
+                provider, model_id, enriched_prompt, category=category,
+                image_b64=request.image_base64, image_url=request.image_url
+            ):
+                full_response.append(token)
+                yield f"data: {token}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            yield f"data: [ERROR] {str(e)}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+# ==================== FEATURE 12: MEMORY ADMIN ENDPOINTS ====================
+@app.get("/memory/{user_id}")
+async def get_user_memories(user_id: str):
+    """Get all stored memories for a user."""
+    db = SessionLocal()
+    try:
+        memories = (
+            db.query(UserMemory)
+            .filter(UserMemory.user_id == user_id)
+            .order_by(UserMemory.importance.desc())
+            .all()
+        )
+        return {
+            "user_id": user_id,
+            "total_memories": len(memories),
+            "memories": [
+                {"id": m.id, "text": m.memory_text, "importance": m.importance,
+                 "created_at": str(m.created_at)}
+                for m in memories
+            ]
+        }
+    finally:
+        db.close()
+
+@app.delete("/memory/{user_id}")
+async def clear_user_memories(user_id: str):
+    """Clear all memories for a user."""
+    db = SessionLocal()
+    try:
+        count = MemoryService.clear_memories(user_id, db)
+        return {"status": "success", "memories_deleted": count}
+    finally:
+        db.close()
+
+@app.delete("/memory/{user_id}/{memory_id}")
+async def delete_single_memory(user_id: str, memory_id: int):
+    """Delete a single memory by ID."""
+    db = SessionLocal()
+    try:
+        success = MemoryService.delete_memory(user_id, memory_id, db)
+        if not success:
+            raise HTTPException(status_code=404, detail="Memory not found.")
+        return {"status": "success", "deleted_id": memory_id}
+    finally:
+        db.close()
+
 # ==================== DEBUG/ADMIN ENDPOINTS ====================
+
 @app.get("/admin/models/check")
 async def check_models():
     """Check models table status."""

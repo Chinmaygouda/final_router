@@ -15,13 +15,16 @@ from google import genai
 import os
 import sys
 
-from database.session import SessionLocal
+from app.database_init import SessionLocal
 from app.models import AIModel
 from database.db import fetch_models
 from app.routing.scoring import score_models, get_top_k
 from app.routing.confidence import compute_confidence
 from app.routing.bandit import call_bandit
-from config.settings import CONFIDENCE_THRESHOLD, TOP_K, TIER_RULES
+from config.settings import (
+    CONFIDENCE_THRESHOLD, TOP_K, TIER_RULES,
+    NON_TEXT_KEYWORDS, VALID_MODEL_PREFIXES, SAFE_FALLBACK_MODELS
+)
 from sqlalchemy import and_, desc
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
@@ -75,39 +78,22 @@ def filter_models(models, category, complexity_score, complexity_label):
     tier2 = []    # Standard medium-complex
     tier3 = []    # Budget low-complex
     
-    # Non-generative model keywords - these models CANNOT produce text chat responses
-    NON_GENERATIVE_KEYWORDS = [
-        # Embedding models
-        "embedding", "embed",
-        # Image generation / vision
-        "image-preview", "image-gen", "imagen", "dall-e", "stable-diffusion",
-        # Audio / TTS / STT
-        "tts", "whisper", "speech", "audio", "voice",
-        # Music generation
-        "lyria", "music",
-        # Video generation
-        "video", "sora",
-        # Robotics / specialized hardware
-        "robotics", "robot",
-        # Live / streaming (not for generateContent)
-        "live-preview", "live",
-        # Safety / moderation classifiers
-        "moderation", "safety", "guard",
-        # Code execution / tools only
-        "code-execution",
-    ]
-    
+    # Imported from config/settings.py (single source of truth)
     for m in models:
         # Skip inactive models
         if not m["active"]:
             continue
-        
-        # Skip non-generative models
+
         model_name_lower = m["name"].lower()
-        if any(kw in model_name_lower for kw in NON_GENERATIVE_KEYWORDS):
+
+        # Skip non-generative models (veo, lyria, imagen, tts, etc.)
+        if any(kw in model_name_lower for kw in NON_TEXT_KEYWORDS):
             continue
-        
-        # FIX: MULTI category should map to AGENTS or CHAT in DB
+
+        # Skip garbage/hallucinated model names (e.g. 'nano-banana-pro-preview')
+        if not any(model_name_lower.startswith(p) for p in VALID_MODEL_PREFIXES):
+            continue
+
         target_categories = [category]
         if category == "MULTI":
             target_categories = ["MULTI", "AGENTS", "CHAT"]
@@ -331,22 +317,26 @@ def get_best_model(user_prompt, user_allowed_tier):
         top_provider = top_model.provider if top_model else "Unknown"
         top_tier = top_model.tier if top_model else 2
         
-        # Resolve fallbacks — EXCLUDE the selected primary model to avoid retry
+        # Cascading fallback: filter candidates to text-only models, then append safe defaults
+        # NON_TEXT_KEYWORDS and SAFE_FALLBACK_MODELS imported from config/settings.py
+        def _is_text_model(mid: str) -> bool:
+            m_lower = mid.lower()
+            return not any(kw in m_lower for kw in NON_TEXT_KEYWORDS)
+
         fallbacks = []
         for c_name in candidate_names:
             if c_name == selected_model_id:
-                continue  # BUG FIX: Don't include primary in fallback list
+                continue  # Skip primary — already being tried first
+            if not _is_text_model(c_name):
+                print(f"   [FALLBACK FILTER] Skipping non-text model: {c_name}")
+                continue
             c_model = db.query(AIModel).filter(AIModel.model_id == c_name).first()
             if c_model:
                 fallbacks.append({"model_id": c_model.model_id, "provider": c_model.provider})
 
-        # Always ensure at least 2 safe generative fallbacks
-        SAFE_FALLBACKS = [
-            {"model_id": "gemini-1.5-flash", "provider": "Google"},
-            {"model_id": "gemini-2.0-flash", "provider": "Google"},
-        ]
+        # Guaranteed safe last-resort fallbacks from settings.py
         fallback_ids = {f["model_id"] for f in fallbacks}
-        for sf in SAFE_FALLBACKS:
+        for sf in SAFE_FALLBACK_MODELS:
             if sf["model_id"] not in fallback_ids and sf["model_id"] != selected_model_id:
                 fallbacks.append(sf)
 

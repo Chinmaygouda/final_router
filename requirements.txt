@@ -1,10 +1,15 @@
+# ============================================================
+# Requirements — AI Router Pipeline
+# Python 3.11 or 3.12 recommended (3.14 breaks Pydantic V1)
+# Run: pip install -r requirements.txt
+# ============================================================
+
 # =============== CORE API =================
 fastapi>=0.110.0
 uvicorn>=0.27.0
 pydantic>=2.6.0
 python-dotenv>=1.0.0
 requests>=2.31.0
-termcolor>=2.4.0
 
 # =============== DATABASE =================
 sqlalchemy>=2.0.0
@@ -17,6 +22,9 @@ openai>=1.14.0
 anthropic>=0.21.0
 cohere>=5.1.0
 
+# =============== LANGCHAIN ================
+langchain-core>=0.3.0
+
 # =============== ROUTING & ML =============
 torch>=2.2.0
 transformers>=4.48.0
@@ -25,3 +33,4 @@ sentence-transformers>=3.4.0
 setfit==1.1.1
 scikit-learn>=1.4.0
 pandas>=2.2.0
+scipy>=1.13.0

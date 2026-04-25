@@ -16,7 +16,7 @@ from config.settings import CONFIDENCE_THRESHOLD, TOP_K, TIER_RULES
 from app.routing.router import filter_models, route_model, get_best_model
 from app.vault_service import VaultService
 from app.models import AIModel
-from database.session import SessionLocal
+from app.database_init import SessionLocal
 
 print("\n" + "="*80)
 print("[COMPLETE FEATURE TEST - ALL SYSTEMS]")

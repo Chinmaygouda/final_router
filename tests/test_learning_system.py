@@ -11,7 +11,7 @@ from app.routing.reward import calculate_reward, infer_quality_score
 from app.routing.thompson_sampler import get_thompson_sampler, reset_thompson_sampler
 from app.routing.bandit import call_bandit, get_bandit_stats, get_model_recommendations
 from database.db import get_model_performance, get_top_performing_models, update_model_performance
-from database.session import SessionLocal
+from app.database_init import SessionLocal
 from app.models import ModelPerformance
 
 print("\n" + "="*80)

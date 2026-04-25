@@ -3,7 +3,7 @@ Database wrapper for model fetching.
 Uses SQLAlchemy ORM instead of raw psycopg2.
 """
 
-from database.session import SessionLocal
+from app.database_init import SessionLocal
 from app.models import AIModel, ModelPerformance
 
 

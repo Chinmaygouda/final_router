@@ -5,7 +5,7 @@ import os
 import hashlib
 from datetime import datetime
 from openai import OpenAI
-from database.session import SessionLocal
+from app.database_init import SessionLocal
 from app.models import AIModel
 from core.librarian import audit_models
 from dotenv import load_dotenv

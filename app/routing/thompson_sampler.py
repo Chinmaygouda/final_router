@@ -195,7 +195,7 @@ def get_thompson_sampler() -> ThompsonSampler:
         _global_sampler = ThompsonSampler()
         # FIX #6: Load persisted bandit state from database
         try:
-            from database.session import SessionLocal
+            from app.database_init import SessionLocal
             from app.models import ModelPerformance
             db = SessionLocal()
             records = db.query(ModelPerformance).all()

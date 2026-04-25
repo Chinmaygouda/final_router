@@ -1,24 +1,24 @@
 from sqlalchemy import Column, Integer, String, Float, DateTime, Text, Boolean, UniqueConstraint
 from sqlalchemy.orm import declarative_base
-from sqlalchemy.dialects.postgresql import UUID # For unique user IDs
-from pgvector.sqlalchemy import Vector # Install: pip install pgvector
+from pgvector.sqlalchemy import Vector
 import datetime
 
 Base = declarative_base() # <--- Create the Base object here
 
-# ==================== TABLE 1: Semantic Vault (NEW) ====================
+# ==================== TABLE 1: Semantic Vault ====================
 class UserConversation(Base):
     __tablename__ = "user_conversations"
 
     id = Column(Integer, primary_key=True)
-    user_id = Column(String, index=True) # Unique ID so User A can't see User B
+    user_id = Column(String, index=True)       # Privacy separation per user
+    session_id = Column(String, index=True, nullable=True)  # Feature 2: Multi-Turn sessions
     prompt = Column(Text)
     response = Column(Text)
     model_used = Column(String)
     tokens_consumed = Column(Integer)
-    actual_cost = Column(Float) # Calculated as tokens * rate
-    # 768 is the default for Gemini text-embedding-004
-    embedding = Column(Vector(768)) 
+    actual_cost = Column(Float)
+    has_image = Column(Boolean, default=False)  # Feature 6: Multi-Modal flag
+    embedding = Column(Vector(768))             # 768-dim Jina v2 embedding
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 # ==================== TABLE 2: System Logs (NEW) ====================
@@ -60,6 +60,24 @@ class ConversationArchive(Base):
     topic_summary = Column(String)
     full_transcript = Column(String) # JSON string of the chat history
     archived_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+# ==================== TABLE 5b: User Memory (Feature 12) ====================
+class UserMemory(Base):
+    """
+    Persistent memory store per user. Extracted automatically from responses.
+    Prepended to future prompts so the model 'remembers' user preferences.
+    e.g. 'User prefers Python', 'User is building an ore detection pipeline'
+    """
+    __tablename__ = "user_memory"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String, index=True, nullable=False)
+    memory_text = Column(Text, nullable=False)  # The remembered fact
+    source_conversation_id = Column(Integer, nullable=True)  # Which conversation created this
+    importance = Column(Float, default=0.5)     # 0.0 (low) to 1.0 (critical)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    last_used = Column(DateTime, default=datetime.datetime.utcnow)
+
 
 # ==================== TABLE 5: Model Performance Tracking (NEW - LEARNING) ====================
 class ModelPerformance(Base):

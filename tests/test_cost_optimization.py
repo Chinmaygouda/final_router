@@ -19,7 +19,7 @@ from app.routing.cost_optimizer import (
     PROVIDER_PRICING
 )
 from database.db import update_model_performance
-from database.session import SessionLocal
+from app.database_init import SessionLocal
 from app.models import ModelPerformance
 
 print("\n" + "="*90)

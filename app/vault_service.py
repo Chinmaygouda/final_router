@@ -4,7 +4,7 @@ import sys
 import time
 from google import genai
 from sqlalchemy import text
-from database.session import SessionLocal
+from app.database_init import SessionLocal
 from app.embedding_engine import generate_vector
 from app.models import UserConversation, SystemLog
 from app.routing.router import get_best_model
@@ -170,20 +170,31 @@ class VaultService:
             return result
         except Exception as e:
             print(f"⚠️ Router failed: {e}. Falling back to Gemini...")
-            return ("gemini-2.5-flash", "Google", 5.0, "UTILITY", 2, [{"model_id": "gemini-1.5-pro", "provider": "Google"}])
+            return ("gemini-3-flash-preview", "Google", 5.0, "UTILITY", 2, [{"model_id": "gemini-2.0-flash", "provider": "Google"}])
 
     # ==================== PHASE 3: EXECUTION WITH DISPATCHER ====================
     @staticmethod
-    def execute_with_provider(provider: str, model_id: str, prompt: str, category: str = "UTILITY"):
+    def execute_with_provider(
+        provider: str, model_id: str, prompt: str,
+        category: str = "UTILITY",
+        image_base64: str = None,   # Feature 6: Multi-Modal
+        image_url: str = None,
+    ):
         """
         Routes request through appropriate provider using dispatcher.
         category is passed to the dispatcher so it can inject the correct
         system prompt (CODE gets code-writing instructions, CHAT gets chat instructions etc.)
+        image_base64 / image_url enable vision/multi-modal requests (Feature 6).
         Returns: {text, tokens, success}
         """
         try:
             print(f"🚀 Executing with {provider} - {model_id}")
-            response = dispatcher.execute(provider, model_id, prompt, category=category)
+            response = dispatcher.execute(
+                provider, model_id, prompt,
+                category=category,
+                image_b64=image_base64,
+                image_url=image_url,
+            )
             return response
         except Exception as e:
             print(f"❌ Dispatcher error: {e}")
@@ -191,15 +202,15 @@ class VaultService:
 
     # ==================== PHASE 4: STORAGE & ARCHIVING ====================
     @staticmethod
-    def save_to_vault(user_id: str, prompt: str, response: str, tokens: int, 
-                     vector: list, cost: float, model_used: str, provider: str):
+    def save_to_vault(user_id: str, prompt: str, response: str, tokens: int,
+                     vector: list, cost: float, model_used: str, provider: str,
+                     session_id: str = None):       # Feature 2: Multi-Turn
         """
         Saves interaction to PostgreSQL vault for future semantic matching.
-        Stores both in DB and Redis.
+        session_id links multiple messages into a conversation (Feature 2).
         """
         db = SessionLocal()
         try:
-            # 1. Save to PostgreSQL
             new_entry = UserConversation(
                 user_id=user_id,
                 prompt=prompt,
@@ -207,11 +218,12 @@ class VaultService:
                 model_used=model_used,
                 tokens_consumed=tokens,
                 actual_cost=cost,
-                embedding=vector
+                embedding=vector,
+                session_id=session_id,   # Feature 2
             )
             db.add(new_entry)
             db.commit()
-            db.refresh(new_entry)  # FIX #10: Get the auto-generated ID
+            db.refresh(new_entry)
             print(f"✅ Vault Updated: Saved ${cost:.4f} interaction from {provider}/{model_used} [ID: {new_entry.id}]")
             return new_entry.id
             

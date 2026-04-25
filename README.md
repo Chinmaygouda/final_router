@@ -1,54 +1,149 @@
-# AI Router Pipeline V1.0
+# AI Router Pipeline v2.0
 
-A resilient AI model router with local DeBERTa-v3 classification, semantic vault caching, and automated multi-provider fallbacks.
+A production-grade AI model router with local DeBERTa-v3 classification, semantic vault caching, cascading multi-provider fallbacks, and persistent user memory.
 
-## 🚀 Getting Started
+## Features
 
-### 1. Prerequisites (Crucial)
-Because this project uses **Git LFS** to store the 539MB local AI model weights, your friends **MUST** have Git LFS installed before cloning, or the model files will appear as tiny 1KB text pointers.
+| Feature | Description |
+|---|---|
+| **Streaming** | Token-by-token SSE responses via `/ask/stream` |
+| **Multi-Turn History** | Conversation context persisted in PostgreSQL, linked by `session_id` |
+| **Multi-Modal Vision** | Image input (base64 or URL) via Gemini, Claude, GPT-4o |
+| **Guardrails** | Prompt injection detection + PII redaction (email, phone, Aadhaar, PAN) |
+| **User Memory** | Persistent per-user facts extracted automatically and prepended to future prompts |
+| **Semantic Cache** | pgvector-backed cache with anti-hallucination scoring (L2 + keyword overlap) |
+| **Operator Prompt** | Global system prompt override via `.env` |
+| **Cascading Fallback** | Same-category → Cross-category → Last-resort with circuit breaker |
+| **Thompson Sampling** | Bandit learns from reward signals to prefer high-performing models |
+| **Prompt Compression** | Local compressor reduces token usage 30-50% before calling any AI |
 
-**Install Git LFS:**
-- **Windows**: `git lfs install`
-- **Mac**: `brew install git-lfs` && `git lfs install`
-- **Linux**: `sudo apt install git-lfs` && `git lfs install`
+## Quick Start
 
-### 2. Cloning the Repo
+### 1. Prerequisites
+
+**Python 3.11 or 3.12** is required. (3.14 has Pydantic V1 incompatibility.)
+
+If you are cloning — install Git LFS first (the DeBERTa model weights are ~539 MB):
 ```bash
-# Regular clone
+git lfs install
 git clone <your-repo-url>
-cd <repo-name>
-
-# Ensure the large model files are actually downloaded
 git lfs pull
 ```
 
-### 3. Setup & Installation
+### 2. Setup
+
 ```bash
-# Create and activate virtual environment
-python -m venv venv
-source venv/Scripts/activate  # Windows
-# source venv/bin/activate    # Mac/Linux
+# Create virtual environment
+python -m venv .venv
+.venv\Scripts\activate   # Windows
+# source .venv/bin/activate  # Mac/Linux
 
 # Install dependencies
 pip install -r requirements.txt
 ```
 
-### 4. Configuration
-Create a `.env` file in the root directory:
-```env
-DATABASE_URL=your_postgresql_url
-GEMINI_API_KEY=your_google_ai_key
-ANTHROPIC_API_KEY=your_anthropic_key (optional)
-OPENAI_API_KEY=your_openai_key (optional)
+### 3. Configure
+
+```bash
+cp .env.example .env
+# Edit .env and fill in your API keys
 ```
 
-### 5. Running the API
+Minimum required keys in `.env`:
+```env
+DATABASE_URL=postgresql://user:password@host/dbname?sslmode=require
+GEMINI_API_KEY=your-google-ai-studio-key
+```
+
+### 4. Run
+
 ```bash
 uvicorn app.main:app --reload
 ```
 
-## 🧠 Key Features
-- **Local Routing**: Uses a fine-tuned DeBERTa-v3 model to classify prompts offline (0ms API latency).
-- **Semantic Vault**: Automatically caches previous AI responses in PostgreSQL + Redis based on semantic similarity.
-- **Failover Logic**: Automatically cycles through 3 fallback candidates if a high-tier provider returns a 404, 503, or 429 error.
-- **Heuristic Intent Detection**: Automatically detects "Multi-step" logic in prompts and routes them to advanced generalist models.
+API docs available at: **http://127.0.0.1:8000/docs**
+
+---
+
+## API Endpoints
+
+### `POST /ask` — Main Endpoint
+```json
+{
+  "user_id": "user_123",
+  "prompt": "Write a Python FastAPI CRUD app",
+  "user_tier": 2,
+  "session_id": "my-session-001",
+  "max_history_turns": 5,
+  "image_url": "https://example.com/image.png"
+}
+```
+
+### `POST /ask/stream` — Streaming (SSE)
+Same body as `/ask`. Returns tokens as Server-Sent Events.
+
+### `GET /memory/{user_id}` — View User Memory
+Returns all extracted facts remembered for a user.
+
+### `DELETE /memory/{user_id}` — Clear Memory
+
+### `POST /feedback` — Submit Quality Feedback
+```json
+{
+  "vault_id": "42",
+  "feedback": 1.0,
+  "comments": "Great response"
+}
+```
+
+### `GET /health` — Health Check
+
+---
+
+## Folder Structure
+
+```
+├── app/
+│   ├── main.py              # FastAPI app, all endpoints
+│   ├── models.py            # SQLAlchemy DB models
+│   ├── vault_service.py     # Semantic cache + routing orchestration
+│   ├── guardrails.py        # Safety checks + PII redaction
+│   ├── memory_service.py    # User memory extraction + retrieval
+│   ├── database_init.py     # DB engine, session factory, migrations
+│   └── routing/
+│       ├── router.py        # Main routing logic (DeBERTa + heuristics)
+│       ├── scoring.py       # Model scoring formula
+│       ├── confidence.py    # Confidence calculation
+│       ├── bandit.py        # Thompson Sampling exploration
+│       ├── circuit_breaker.py  # Per-model failure tracking
+│       ├── reward.py        # Reward signal computation
+│       └── prompt_compressor.py  # Token reduction
+├── core/
+│   ├── dispatcher.py        # Multi-provider AI execution engine
+│   ├── auto_discovery.py    # Librarian: syncs available models from providers
+│   └── librarian.py        # Model registry manager
+├── config/
+│   └── settings.py          # All tunable constants (thresholds, weights, keywords)
+├── database/
+│   └── db.py                # Model fetch helpers
+├── docs/                    # Development notes and architecture docs
+├── _archive/                # Deprecated files (not in active Python packages)
+├── models/                  # Local ML model weights (DeBERTa, via Git LFS)
+├── .env.example             # Environment variable template
+└── requirements.txt
+```
+
+---
+
+## Environment Variables
+
+See `.env.example` for the full list. Key variables:
+
+| Variable | Required | Description |
+|---|---|---|
+| `DATABASE_URL` | ✅ | PostgreSQL connection string (NeonDB, Supabase, etc.) |
+| `GEMINI_API_KEY` | ✅ | Primary AI provider + router backbone |
+| `ANTHROPIC_API_KEY` | Optional | Claude fallback |
+| `OPENAI_API_KEY` | Optional | GPT-4o fallback |
+| `OPERATOR_SYSTEM_PROMPT` | Optional | Customizes all AI responses globally |
+| `API_SECRET_KEY` | Optional | Bearer token for endpoint security |

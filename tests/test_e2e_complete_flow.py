@@ -8,7 +8,7 @@ import os
 import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from database.session import SessionLocal
+from app.database_init import SessionLocal
 from database.db import fetch_models, get_model_performance, get_top_performing_models
 from app.models import UserConversation, ModelPerformance
 from app.embedding_engine import generate_vector

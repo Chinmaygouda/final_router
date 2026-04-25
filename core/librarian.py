@@ -5,7 +5,7 @@ import os
 from sqlalchemy import desc
 from sqlalchemy.exc import SQLAlchemyError
 from dotenv import load_dotenv
-from database.session import SessionLocal
+from app.database_init import SessionLocal
 from app.models import AIModel
 
 load_dotenv()

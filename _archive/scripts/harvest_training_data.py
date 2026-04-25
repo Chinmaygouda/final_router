@@ -63,7 +63,7 @@ def generate_synthetic_prompts(category: str, count: int) -> list:
         return []
 
 def extract_from_db():
-    from database.session import SessionLocal
+    from app.database_init import SessionLocal
     from app.models import UserConversation
     
     db = SessionLocal()
