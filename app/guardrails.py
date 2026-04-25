@@ -14,6 +14,24 @@ import re
 from dataclasses import dataclass, field
 from typing import List
 
+# Global ML Guardrail Singleton
+_ml_guardrail_pipeline = None
+
+def get_ml_guardrail():
+    global _ml_guardrail_pipeline
+    if _ml_guardrail_pipeline is None:
+        from transformers import pipeline
+        import logging
+        logging.getLogger("transformers").setLevel(logging.ERROR)
+        print("[*] Initializing ML Guardrails (ProtectAI/deberta-v3-base-prompt-injection-v2)...")
+        _ml_guardrail_pipeline = pipeline(
+            "text-classification",
+            model="ProtectAI/deberta-v3-base-prompt-injection-v2",
+            truncation=True,
+            max_length=512
+        )
+    return _ml_guardrail_pipeline
+
 
 # ─────────────────────────────────────────────────────────────
 # PII Patterns
@@ -90,12 +108,27 @@ class GuardrailsChecker:
         """
         result = GuardrailResult(redacted_prompt=prompt)
 
-        # ── 1. Prompt Injection Detection ──────────────────────────
+        # ── 1. Prompt Injection Detection (Regex) ──────────────────
         for pattern in INJECTION_PATTERNS:
             if re.search(pattern, prompt, re.IGNORECASE):
                 result.blocked = True
-                result.reason = "Prompt injection attempt detected."
+                result.reason = "Prompt injection attempt detected (Regex Match)."
                 return result
+
+        # ── 1.5 Prompt Injection Detection (ML Tier 2) ────────────────
+        try:
+            ml_scanner = get_ml_guardrail()
+            # The model max length is 512 tokens. We truncate the string safely.
+            ml_result = ml_scanner(prompt[:2000])[0] 
+            
+            # ProtectAI model usually outputs 'INJECTION' and 'SAFE'
+            # We use a very strict threshold (0.995) to prevent false positives
+            if ml_result['label'] == 'INJECTION' and ml_result['score'] > 0.995:
+                result.blocked = True
+                result.reason = f"Prompt injection attempt detected (ML Confidence: {ml_result['score']:.2f})."
+                return result
+        except Exception as e:
+            result.warnings.append(f"ML Guardrail failed: {e}")
 
         # ── 2. Blocked Harmful Keywords ────────────────────────────
         prompt_lower = prompt.lower()

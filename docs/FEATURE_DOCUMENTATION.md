@@ -29,10 +29,15 @@ This document provides a detailed explanation of all active features in the AI R
 **Description:** Seamlessly supports base64 image strings or public image URLs. The `Dispatcher` handles mapping these to the appropriate multi-modal provider APIs (Google Gemini, Claude 3.5, GPT-4o).
 **Benefit:** Users can send images for OCR or visual analysis effortlessly.
 
-## 6. Guardrails & PII Redaction
-**Implemented:** April 24, 2026
-**Description:** Evaluates prompts *before* routing. It uses regex patterns to redact PII (Emails, Phones, SSN, Aadhaar, PAN) and blocks common prompt injection patterns (`ignore previous instructions`, `DAN mode`).
-**Benefit:** Enforces strong security compliance and protects sensitive user data without needing an LLM.
+### 7. Tiered Content Guardrails (Regex + ML)
+**Status:** Active  
+**Component:** `app.guardrails`
+
+A zero-latency, two-tier local security layer that inspects every prompt before routing.
+- **Tier 1 (Regex):** Instant detection of PII (Emails, Indian Phone Numbers, International Phones, Credit Cards, Aadhaar, PAN, SSN), blocked keywords ("how to make a bomb"), and overt prompt injections.
+- **Tier 2 (Machine Learning):** A tiny, lightning-fast local DeBERTa model (`ProtectAI/deberta-v3-base-prompt-injection-v2`) that catches subtle, complex roleplay jailbreaks that evade Regex rules.
+- **Action:** Triggers a 400 Bad Request instantly, costing $0.00 in LLM API fees for blocked content.
+- **Test:** Run `python scripts/guardrails_testscript.py` to see PII redaction and ML injection blocking in action.
 
 ## 7. Persistent User Memory
 **Implemented:** April 2026
@@ -62,9 +67,8 @@ This document provides a detailed explanation of all active features in the AI R
    * Currently, the system relies on user-provided `user_id` strings. Integrating a real auth system will secure the endpoints.
 2. **Cost Budget Caps:**
    * Enforce hard limits on `cost_per_1m_tokens` consumed per `user_id` to prevent abuse.
-3. **Admin UI Dashboard:**
-   * A web interface (React/Vite or FastAPI templates) to view routing metrics, edit memory, and manage model tiers without touching the database.
-4. **LLM-Based Guardrails (Secondary Tier):**
-   * Regex-based guardrails are fast but rigid. Implement a lightweight local LLM (e.g., Llama-3-8B) as an optional deep-inspection layer for high-risk prompts.
-5. **Redis Fallback Cache:**
-   * Currently, Redis is disabled in favor of PostgreSQL. Re-enabling Redis for pure exact-match string caching will reduce DB load for exact duplicate queries.
+### 3. Admin UI Dashboard
+A lightweight frontend dashboard to visualize daily token costs, view the Thompson Sampling win-rates in real-time, or toggle models to `is_active=False` with the click of a button instead of writing SQL.
+
+### 4. Asynchronous Webhooks for Long Tasks
+Enable non-blocking status updates for long-running chain-of-thought tasks via callback URLs.
