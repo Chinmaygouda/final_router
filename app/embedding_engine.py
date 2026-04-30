@@ -12,21 +12,27 @@ from langchain_huggingface import HuggingFaceEmbeddings
 # 30-60 seconds on every restart, making /health and all other fast endpoints
 # respond instantly.
 
+import threading
+
 model_name = "BAAI/bge-base-en-v1.5"
 _embeddings = None  # Lazy singleton
+_embeddings_lock = threading.Lock()
 
 
 def _get_embeddings():
-    """Return the embedding model, loading it on first call only."""
+    """Return the embedding model, loading it on first call only (Thread Safe)."""
     global _embeddings
     if _embeddings is None:
-        print(f"⚙️  Loading embedding model: {model_name} (first request only)...")
-        _embeddings = HuggingFaceEmbeddings(
-            model_name=model_name,
-            model_kwargs={"device": "cpu"},
-            encode_kwargs={"normalize_embeddings": True},  # BGE requires normalization
-        )
-        print(f"✅ Embedding model ready.")
+        with _embeddings_lock:
+            # Double-check pattern to prevent race conditions
+            if _embeddings is None:
+                print(f"⚙️  Loading embedding model: {model_name} (first request only)...")
+                _embeddings = HuggingFaceEmbeddings(
+                    model_name=model_name,
+                    model_kwargs={"device": "cpu"},
+                    encode_kwargs={"normalize_embeddings": True},  # BGE requires normalization
+                )
+                print(f"✅ Embedding model ready.")
     return _embeddings
 
 
