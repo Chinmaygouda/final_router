@@ -9,8 +9,8 @@ from app.database_init import SessionLocal
 from app.models import AIModel
 
 load_dotenv()
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-
+from core.dispatcher import Dispatcher
+dispatcher = Dispatcher()
 ALLOWED_CATEGORIES = ["CODE", "AGENTS", "ANALYSIS", "EXTRACTION", "CREATIVE", "UTILITY", "CHAT"]
 
 CATEGORY_MAP = {
@@ -51,25 +51,66 @@ def audit_models(provider_name, model_list):
     """Processes models into the DB, allowing one model to occupy multiple rows/categories."""
     # BUG #1 FIX: Use confirmed-working model names (verified via client.models.list()).
     # Previous list used invalid/deprecated names that returned 404 from the generateContent API.
-    audit_candidates = ['gemini-2.0-flash', 'gemini-flash-latest', 'gemini-2.0-flash-lite']
+    audit_candidates = []
+    
+    # 1. Try active Utility models from the database first
+    db = SessionLocal()
+    try:
+        db_models = db.query(AIModel).filter(
+            AIModel.is_active == True,
+            AIModel.category.in_(["UTILITY", "CHAT", "CODE"]),
+            ~AIModel.model_id.startswith("---")
+        ).order_by(AIModel.tier.asc()).limit(3).all()
+        for m in db_models:
+            audit_candidates.append((m.provider, m.model_id))
+    except Exception:
+        pass
+    finally:
+        db.close()
+        
+    # 2. Try the models we just discovered for this provider
+    # If the user only has one obscure API key, we use that API's own models to categorize itself!
+    for m in model_list[:3]:
+        audit_candidates.append((provider_name, m))
+        
+    # 3. Finally, known good global fallbacks
+    fallbacks = [
+        ("Google", "gemini-2.5-flash"),
+        ("OpenAI", "gpt-4o-mini"),
+        ("Anthropic", "claude-3-5-haiku-20241022"),
+        ("NVIDIA", "meta/llama-3.1-70b-instruct")
+    ]
+    audit_candidates.extend(fallbacks)
+    
+    # Deduplicate while preserving order
+    seen = set()
+    unique_candidates = []
+    for prov, mod in audit_candidates:
+        if (prov, mod) not in seen:
+            seen.add((prov, mod))
+            unique_candidates.append((prov, mod))
+    
+    audit_candidates = unique_candidates
     response = None
     
     print(f"📡 Requesting audit for {len(model_list)} models...")
     
-    for model_name in audit_candidates:
+    for provider, model_name in audit_candidates:
         try:
-            print(f"尝试 (Attempting) with {model_name}...")
+            print(f"尝试 (Attempting) with {provider}/{model_name}...")
             # Format the model list as a clean string for the prompt
             models_string = "\n".join(model_list)
-            response = client.models.generate_content(
-                model=model_name, 
-                contents=f"{LIBRARIAN_PROMPT}\n\nModels:\n{models_string}"
-            )
-            if response and response.text:
-                print(f"✅ AI Response received using {model_name}")
+            
+            res = dispatcher.execute(provider, model_name, f"{LIBRARIAN_PROMPT}\n\nModels:\n{models_string}")
+            
+            if res.get("success") and res.get("text"):
+                class DummyResponse:
+                    text = res["text"]
+                response = DummyResponse()
+                print(f"✅ AI Response received using {provider}/{model_name}")
                 break
         except Exception as e:
-            print(f"⚠️ {model_name} failed: {e}")
+            print(f"⚠️ {provider}/{model_name} failed: {e}")
             continue
 
     if not response or not response.text:
