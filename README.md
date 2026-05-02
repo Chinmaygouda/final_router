@@ -4,20 +4,18 @@ A production-grade AI model router with local DeBERTa-v3 classification, semanti
 
 ## Features
 
-| Feature | Description |
-|---|---|
-| **Streaming** | Token-by-token SSE responses via `/ask/stream` |
-| **Multi-Turn History** | Conversation context persisted in PostgreSQL, linked by `session_id` |
-| **Multi-Modal Vision** | Image input (base64 or URL) via Gemini, Claude, GPT-4o |
-| **Guardrails** | Prompt injection detection + PII redaction (email, phone, Aadhaar, PAN) |
-| **User Memory** | Persistent per-user facts extracted automatically and prepended to future prompts |
-| **Semantic Cache** | `pgvector` PostgreSQL cache using local `bge-base-en-v1.5` embeddings (No Redis required!) |
-| **Cost Tracking** | Dynamic price-per-token calculation streamed via `[METRICS]` SSE payload |
-| **API Validation** | Secure `/test-key` endpoint to validate provider keys without browser CORS issues |
-| **Operator Prompt** | Global system prompt override via `.env` |
-| **Cascading Fallback** | Same-category → Cross-category → Last-resort with circuit breaker |
-| **Thompson Sampling** | Bandit learns from reward signals to prefer high-performing models |
-| **Prompt Compression** | Local compressor reduces token usage 30-50% before calling any AI |
+| Feature                | Description                                                                                |
+| ---------------------- | ------------------------------------------------------------------------------------------ |
+| **Streaming**          | Token-by-token SSE responses via `/ask/stream`                                             |
+| **Multi-Modal Vision** | Image input (base64 or URL) via Gemini, Claude, GPT-4o                                     |
+| **Guardrails**         | Prompt injection detection + PII redaction (email, phone, Aadhaar, PAN)                    |
+| **Semantic Cache**     | `pgvector` PostgreSQL cache using local `bge-base-en-v1.5` embeddings (No Redis required!) |
+| **Cost Tracking**      | Dynamic price-per-token calculation streamed via `[METRICS]` SSE payload                   |
+| **API Validation**     | Secure `/test-key` endpoint to validate provider keys without browser CORS issues          |
+| **Operator Prompt**    | Global system prompt override via `.env`                                                   |
+| **Cascading Fallback** | Same-category → Cross-category → Last-resort with circuit breaker                          |
+| **Thompson Sampling**  | Bandit learns from reward signals to prefer high-performing models                         |
+| **Prompt Compression** | Local compressor reduces token usage 30-50% before calling any AI                          |
 
 ## Quick Start
 
@@ -26,6 +24,7 @@ A production-grade AI model router with local DeBERTa-v3 classification, semanti
 **Python 3.11 or 3.12** is required. (3.14 has Pydantic V1 incompatibility.)
 
 If you are cloning — install Git LFS first (the DeBERTa model weights are ~539 MB):
+
 ```bash
 git lfs install
 git clone <your-repo-url>
@@ -52,10 +51,28 @@ cp .env.example .env
 ```
 
 Minimum required keys in `.env`:
+
 ```env
 DATABASE_URL=postgresql://user:password@host/dbname?sslmode=require
 GEMINI_API_KEY=your-google-ai-studio-key
+TRANSFORMERS_OFFLINE=1
+HF_HUB_OFFLINE=1
 ```
+
+### 3b. Download Embedding Model (First Time Only)
+
+The semantic cache uses `BAAI/bge-base-en-v1.5` embeddings. Download it once before running:
+
+```bash
+# Download model to local cache (~440 MB)
+huggingface-cli download BAAI/bge-base-en-v1.5
+
+# Verify .env has offline flags set (already in .env.example)
+# TRANSFORMERS_OFFLINE=1
+# HF_HUB_OFFLINE=1
+```
+
+This caches the model locally so it works **100% offline** after the first download, with **zero Redis required**.
 
 ### 4. Run
 
@@ -70,26 +87,22 @@ API docs available at: **http://127.0.0.1:8000/docs**
 ## API Endpoints
 
 ### `POST /ask` — Main Endpoint
+
 ```json
 {
   "user_id": "user_123",
   "prompt": "Write a Python FastAPI CRUD app",
   "user_tier": 2,
-  "session_id": "my-session-001",
-  "max_history_turns": 5,
   "image_url": "https://example.com/image.png"
 }
 ```
 
 ### `POST /ask/stream` — Streaming (SSE)
+
 Same body as `/ask`. Returns tokens as Server-Sent Events.
 
-### `GET /memory/{user_id}` — View User Memory
-Returns all extracted facts remembered for a user.
-
-### `DELETE /memory/{user_id}` — Clear Memory
-
 ### `POST /test-key` — Validate API Keys
+
 ```json
 {
   "provider": "Google",
@@ -99,6 +112,7 @@ Returns all extracted facts remembered for a user.
 ```
 
 ### `POST /feedback` — Submit Quality Feedback
+
 ```json
 {
   "vault_id": "42",
@@ -119,7 +133,6 @@ Returns all extracted facts remembered for a user.
 │   ├── models.py            # SQLAlchemy DB models
 │   ├── vault_service.py     # Semantic cache + routing orchestration
 │   ├── guardrails.py        # Safety checks + PII redaction
-│   ├── memory_service.py    # User memory extraction + retrieval
 │   ├── database_init.py     # DB engine, session factory, migrations
 │   └── routing/
 │       ├── router.py        # Main routing logic (DeBERTa + heuristics)
@@ -149,11 +162,11 @@ Returns all extracted facts remembered for a user.
 
 See `.env.example` for the full list. Key variables:
 
-| Variable | Required | Description |
-|---|---|---|
-| `DATABASE_URL` | ✅ | PostgreSQL connection string (NeonDB, Supabase, etc.) |
-| `GEMINI_API_KEY` | ✅ | Primary AI provider + router backbone |
-| `ANTHROPIC_API_KEY` | Optional | Claude fallback |
-| `OPENAI_API_KEY` | Optional | GPT-4o fallback |
-| `OPERATOR_SYSTEM_PROMPT` | Optional | Customizes all AI responses globally |
-| `API_SECRET_KEY` | Optional | Bearer token for endpoint security |
+| Variable                 | Required | Description                                           |
+| ------------------------ | -------- | ----------------------------------------------------- |
+| `DATABASE_URL`           | ✅       | PostgreSQL connection string (NeonDB, Supabase, etc.) |
+| `GEMINI_API_KEY`         | ✅       | Primary AI provider + router backbone                 |
+| `ANTHROPIC_API_KEY`      | Optional | Claude fallback                                       |
+| `OPENAI_API_KEY`         | Optional | GPT-4o fallback                                       |
+| `OPERATOR_SYSTEM_PROMPT` | Optional | Customizes all AI responses globally                  |
+| `API_SECRET_KEY`         | Optional | Bearer token for endpoint security                    |

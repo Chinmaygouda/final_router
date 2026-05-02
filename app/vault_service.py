@@ -99,7 +99,7 @@ class VaultService:
             
             # Layer 2: Minimum keyword overlap required
             # Increased to 0.75 to be extremely strict and prevent short sentence collisions
-            KEYWORD_OVERLAP_MIN = 0.75
+            KEYWORD_OVERLAP_MIN = 0.72
             
             # Fetch top 3 candidates (not just the closest one)
             # This allows us to verify before committing to a match
@@ -176,6 +176,7 @@ class VaultService:
     def execute_with_provider(
         provider: str, model_id: str, prompt: str,
         category: str = "UTILITY",
+        complexity_score: float = 5.0,
         image_base64: str = None,   # Feature 6: Multi-Modal
         image_url: str = None,
     ):
@@ -191,6 +192,7 @@ class VaultService:
             response = dispatcher.execute(
                 provider, model_id, prompt,
                 category=category,
+                complexity_score=complexity_score,
                 image_b64=image_base64,
                 image_url=image_url,
             )
@@ -202,11 +204,9 @@ class VaultService:
     # ==================== PHASE 4: STORAGE & ARCHIVING ====================
     @staticmethod
     def save_to_vault(user_id: str, prompt: str, response: str, tokens: int,
-                     vector: list, cost: float, model_used: str, provider: str,
-                     session_id: str = None):       # Feature 2: Multi-Turn
+                     vector: list, cost: float, model_used: str, provider: str):
         """
         Saves interaction to PostgreSQL vault for future semantic matching.
-        session_id links multiple messages into a conversation (Feature 2).
         """
         db = SessionLocal()
         try:
@@ -218,7 +218,6 @@ class VaultService:
                 tokens_consumed=tokens,
                 actual_cost=cost,
                 embedding=vector,
-                session_id=session_id,   # Feature 2
             )
             db.add(new_entry)
             db.commit()
@@ -254,85 +253,7 @@ class VaultService:
         #     print(f"⚠️ Redis caching warning: {e}")
         pass
 
-    # ==================== MEMORY MANAGEMENT ====================
-    @staticmethod
-    def get_session_context(user_id: str):
-        """
-        Retrieves recent conversation context from PostgreSQL.
-        (Redis caching disabled for now)
-        """
-        # Using PostgreSQL only since Redis is disabled
-        db = SessionLocal()
-        try:
-            recent = db.query(UserConversation).filter(
-                UserConversation.user_id == user_id
-            ).order_by(UserConversation.created_at.desc()).limit(5).all()
-            return [{"prompt": c.prompt, "response": c.response} for c in recent]
-        finally:
-            db.close()
 
-    @staticmethod
-    def check_topic_change(user_id: str, new_prompt: str):
-        """
-        Topic change detection disabled for now (Redis disabled).
-        Will be enabled when Redis is configured.
-        """
-        # Topic detection requires active Redis session
-        # Skipping for now
-        return False
-        
-        # Code below commented for future Redis setup:
-        # if not REDIS_AVAILABLE or not r:
-        #     return False
-        # 
-        # try:
-        #     context = VaultService.get_session_context(user_id)
-        #     if not context:
-        #         return False
-        #     
-        #     check_prompt = f"Previous: {context[-1] if context else 'None'}\nNew: {new_prompt}\nTopic changed significantly? YES/NO"
-        #     model = genai.GenerativeModel("gemini-2.5-flash")
-        #     response = model.generate_content(check_prompt)
-        #     
-        #     if "YES" in response.text.upper():
-        #         VaultService._archive_session(user_id, context)
-        #         r.delete(f"chat:{user_id}")
-        #         r.delete(f"summary:{user_id}")
-        #         print(f"📦 ARCHIVED: Previous conversation for {user_id}")
-        #         return True
-        #     return False
-        # except Exception as e:
-        #     print(f"⚠️ Topic detection warning: {e}")
-        #     return False
-
-    @staticmethod
-    def _archive_session(user_id: str, context: list):
-        """Archives completed conversation to PostgreSQL."""
-        from app.models import ConversationArchive
-        
-        db = SessionLocal()
-        try:
-            # Generate title for the archived conversation
-            if context:
-                title_prompt = f"Summarize this conversation in 5 words: {json.dumps(context[:3])}"
-                title_res = dispatcher.execute("Google", "gemini-2.5-flash", title_prompt)
-                topic = "General Discussion"
-                if title_res.get("success"):
-                    topic = title_res["text"].strip().replace('"', '')[:50] or "General"
-            else:
-                topic = "General Discussion"
-            
-            archive = ConversationArchive(
-                session_id=user_id,
-                topic_summary=topic,
-                full_transcript=json.dumps(context)
-            )
-            db.add(archive)
-            db.commit()
-        except Exception as e:
-            print(f"⚠️ Archive warning: {e}")
-        finally:
-            db.close()
 
     # ==================== LEARNING & OPTIMIZATION ====================
     @staticmethod

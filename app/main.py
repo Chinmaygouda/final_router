@@ -26,14 +26,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from app.database_init import initialize_v2_db
 from app.vault_service import VaultService
 from app.embedding_engine import generate_vector
-from app.models import UserConversation, AIModel, UserMemory
+from app.models import UserConversation, AIModel
 from app.database_init import SessionLocal          # Single DB engine — no split brain
 from core.auto_discovery import run_auto_update
 from core.dispatcher import get_dispatcher           # Use singleton, not module-level instance
 from app.routing.prompt_compressor import get_prompt_compressor
 from app.routing.circuit_breaker import get_circuit_breaker
 from app.guardrails import GuardrailsChecker         # Feature 7
-from app.memory_service import MemoryService         # Feature 12
 from config.settings import NON_TEXT_KEYWORDS, SAFE_FALLBACK_MODELS
 
 # --- SEED MODELS FUNCTION ---
@@ -128,9 +127,6 @@ class QueryRequest(BaseModel):
     user_id: str                        # Required for privacy separation
     prompt: str                         # The user's question
     user_tier: int = 1                  # 1=Premium, 2=Standard, 3=Budget
-    # Feature 2: Multi-Turn Conversation History
-    session_id: Optional[str] = None    # Links messages in a conversation
-    max_history_turns: int = 5          # How many past turns to include
     # Feature 6: Multi-Modal Input
     image_base64: Optional[str] = None  # Base64-encoded image (e.g. ore image)
     image_url: Optional[str] = None     # Or a public image URL
@@ -164,8 +160,6 @@ async def ask_unified(request: QueryRequest):
     print(f"📝 Prompt: {request.prompt[:60]}...")
     if request.image_base64 or request.image_url:
         print("🖼️  Image detected — Multi-Modal request (Feature 6)")
-    if request.session_id:
-        print(f"💬 Session: {request.session_id} (Multi-Turn - Feature 2)")
 
     # --- RATE LIMITING ---
     if not _check_rate_limit(request.user_id):
@@ -196,7 +190,7 @@ async def ask_unified(request: QueryRequest):
         )
 
         if cache_result:
-            response_text, tokens_used, cost = cache_result
+            response_text, tokens_used, cost, vault_id = cache_result
             print(f"✅ CACHE HIT | Saved tokens: {tokens_used} | Cost averted: ${cost:.4f}")
             return QueryResponse(
                 status="Success",
@@ -210,47 +204,9 @@ async def ask_unified(request: QueryRequest):
                         "cost_usd": 0.0,
                         "original_tokens": tokens_used
                     }
-                }
+                },
+                vault_id=str(vault_id)
             )
-
-        # ── FEATURE 2: CONVERSATION HISTORY ──────────────────────
-        history_context = ""
-        if request.session_id:
-            db = SessionLocal()
-            try:
-                history_turns = (
-                    db.query(UserConversation)
-                    .filter(
-                        UserConversation.user_id == request.user_id,
-                        UserConversation.session_id == request.session_id
-                    )
-                    .order_by(UserConversation.created_at.desc())
-                    .limit(request.max_history_turns)
-                    .all()
-                )
-                if history_turns:
-                    turns_text = []
-                    for turn in reversed(history_turns):
-                        turns_text.append(f"User: {turn.prompt}")
-                        turns_text.append(f"Assistant: {turn.response[:500]}")
-                    history_context = "[CONVERSATION HISTORY]\n" + "\n".join(turns_text) + "\n[END HISTORY]\n\n"
-                    print(f"[HISTORY] 💬 Loaded {len(history_turns)} previous turn(s)")
-            finally:
-                db.close()
-
-        # ── FEATURE 12: PERSISTENT USER MEMORY ───────────────────
-        memory_context = ""
-        db = SessionLocal()
-        try:
-            memories = MemoryService.get_memories(request.user_id, db)
-            if memories:
-                memory_context = MemoryService.build_memory_context(memories)
-                print(f"[MEMORY] 🧠 Loaded {len(memories)} user memories")
-        finally:
-            db.close()
-
-        # Combine all context into final enriched prompt
-        enriched_prompt = f"{memory_context}{history_context}{safe_prompt}"
 
         # ======================================================
         # PHASE 2: INTELLIGENT ROUTING (Select Best Model)
@@ -275,15 +231,15 @@ async def ask_unified(request: QueryRequest):
         compressor = get_prompt_compressor()
         compressed_user_msg, compression_metrics = compressor.compress(request.prompt, category)
 
-        # Re-attach history + memory AFTER compression so context always reaches the AI
-        compressed_prompt = f"{memory_context}{history_context}{compressed_user_msg}"
+        # Re-attach safety context AFTER compression
+        compressed_prompt = compressed_user_msg
 
         orig_preview = request.prompt[:200].replace('\n', ' ').strip()
         comp_preview = compressed_user_msg[:200].replace('\n', ' ').strip()
-        print(f"\n[COMPRESSION] Token Reduction (user message only):")
+        print(f"\n[COMPRESSION] Token Reduction:")
         print(f"  ORIGINAL  ({compression_metrics['original_words']}w): {orig_preview}{'...' if len(request.prompt) > 200 else ''}")
         print(f"  COMPRESSED({compression_metrics['compressed_words']}w): {comp_preview}{'...' if len(compressed_user_msg) > 200 else ''}")
-        print(f"  Saved: {compression_metrics['savings_percent']}% | History/Memory context preserved and prepended")
+        print(f"  Saved: {compression_metrics['savings_percent']}%")
 
         execution_success = False
         real_ai_response = ""
@@ -349,6 +305,7 @@ async def ask_unified(request: QueryRequest):
 
             response_data = VaultService.execute_with_provider(
                 c_provider, c_model, compressed_prompt, category=category,
+                complexity_score=score,
                 image_base64=request.image_base64,
                 image_url=request.image_url
             )
@@ -407,7 +364,6 @@ async def ask_unified(request: QueryRequest):
             cost,
             model_id,
             provider,
-            session_id=request.session_id,  # Feature 2: track conversation session
         )
 
         # ======================================================
@@ -426,18 +382,6 @@ async def ask_unified(request: QueryRequest):
         except Exception as e:
             print(f"⚠️ Learning update warning (non-fatal): {e}")
 
-        # Feature 12: Extract and persist user memories (non-fatal)
-        try:
-            db = SessionLocal()
-            MemoryService.save_memories(
-                request.user_id, db,
-                prompt=request.prompt,
-                response=real_ai_response,
-                conversation_id=vault_id
-            )
-            db.close()
-        except Exception as e:
-            print(f"⚠️ Memory extraction warning (non-fatal): {e}")
 
         print("="*70 + "\n")
 
@@ -565,7 +509,7 @@ async def health():
         "status": "OK",
         "redis_available": False,
         "mode": "PostgreSQL Only (Redis Disabled)",
-        "features": ["streaming", "conversation_history", "multi_modal", "guardrails", "user_memory", "operator_prompts"]
+        "features": ["streaming", "multi_modal", "guardrails", "operator_prompts"]
     }
 
 # ==================== FEATURE 1: STREAMING ENDPOINT ====================
@@ -588,38 +532,6 @@ async def ask_stream(request: QueryRequest):
         raise HTTPException(status_code=400, detail=f"Blocked: {safety.reason}")
     safe_prompt = safety.redacted_prompt
 
-    # Feature 2: Conversation History
-    history_context = ""
-    if request.session_id:
-        db = SessionLocal()
-        try:
-            turns = (
-                db.query(UserConversation)
-                .filter(UserConversation.user_id == request.user_id,
-                        UserConversation.session_id == request.session_id)
-                .order_by(UserConversation.created_at.desc())
-                .limit(request.max_history_turns).all()
-            )
-            if turns:
-                lines = []
-                for t in reversed(turns):
-                    lines += [f"User: {t.prompt}", f"Assistant: {t.response[:500]}"]
-                history_context = "[CONVERSATION HISTORY]\n" + "\n".join(lines) + "\n[END HISTORY]\n\n"
-        finally:
-            db.close()
-
-    # Feature 12: Memory
-    memory_context = ""
-    db = SessionLocal()
-    try:
-        memories = MemoryService.get_memories(request.user_id, db)
-        if memories:
-            memory_context = MemoryService.build_memory_context(memories)
-    finally:
-        db.close()
-
-    enriched_prompt = f"{memory_context}{history_context}{safe_prompt}"
-
     # Route on the actual user question ONLY — not enriched_prompt.
     # Prevents ML heuristic from misclassifying history context words as CODE.
     model_id, provider, score, category, tier, fallbacks = VaultService.get_best_provider_and_model(
@@ -631,7 +543,8 @@ async def ask_stream(request: QueryRequest):
         full_response = []
         try:
             async for token in get_dispatcher().execute_stream(
-                provider, model_id, enriched_prompt, category=category,
+                provider, model_id, safe_prompt, category=category,
+                complexity_score=score,
                 image_b64=request.image_base64, image_url=request.image_url
             ):
                 full_response.append(token)
@@ -643,51 +556,6 @@ async def ask_stream(request: QueryRequest):
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
-# ==================== FEATURE 12: MEMORY ADMIN ENDPOINTS ====================
-@app.get("/memory/{user_id}")
-async def get_user_memories(user_id: str):
-    """Get all stored memories for a user."""
-    db = SessionLocal()
-    try:
-        memories = (
-            db.query(UserMemory)
-            .filter(UserMemory.user_id == user_id)
-            .order_by(UserMemory.importance.desc())
-            .all()
-        )
-        return {
-            "user_id": user_id,
-            "total_memories": len(memories),
-            "memories": [
-                {"id": m.id, "text": m.memory_text, "importance": m.importance,
-                 "created_at": str(m.created_at)}
-                for m in memories
-            ]
-        }
-    finally:
-        db.close()
-
-@app.delete("/memory/{user_id}")
-async def clear_user_memories(user_id: str):
-    """Clear all memories for a user."""
-    db = SessionLocal()
-    try:
-        count = MemoryService.clear_memories(user_id, db)
-        return {"status": "success", "memories_deleted": count}
-    finally:
-        db.close()
-
-@app.delete("/memory/{user_id}/{memory_id}")
-async def delete_single_memory(user_id: str, memory_id: int):
-    """Delete a single memory by ID."""
-    db = SessionLocal()
-    try:
-        success = MemoryService.delete_memory(user_id, memory_id, db)
-        if not success:
-            raise HTTPException(status_code=404, detail="Memory not found.")
-        return {"status": "success", "deleted_id": memory_id}
-    finally:
-        db.close()
 
 # ==================== DEBUG/ADMIN ENDPOINTS ====================
 

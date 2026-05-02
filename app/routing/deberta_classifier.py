@@ -23,6 +23,19 @@ try:
         class DatasetFilter:
             pass
         huggingface_hub.DatasetFilter = DatasetFilter
+        
+    import setfit
+    import setfit.model_card
+    if hasattr(setfit.model_card.SetFitModelCardData, 'infer_st_id'):
+        def safe_infer_st_id(self, model_id):
+            if model_id is None: return
+            try:
+                self._old_infer_st_id(model_id)
+            except Exception:
+                pass
+        if not hasattr(setfit.model_card.SetFitModelCardData, '_old_infer_st_id'):
+            setfit.model_card.SetFitModelCardData._old_infer_st_id = setfit.model_card.SetFitModelCardData.infer_st_id
+            setfit.model_card.SetFitModelCardData.infer_st_id = safe_infer_st_id
     # -----------------------------------------------------------
     
     from setfit import SetFitModel

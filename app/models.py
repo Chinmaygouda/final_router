@@ -11,7 +11,6 @@ class UserConversation(Base):
 
     id = Column(Integer, primary_key=True)
     user_id = Column(String, index=True)       # Privacy separation per user
-    session_id = Column(String, index=True, nullable=True)  # Feature 2: Multi-Turn sessions
     prompt = Column(Text)
     response = Column(Text)
     model_used = Column(String)
@@ -50,33 +49,6 @@ class AIModel(Base):
     __table_args__ = (
         UniqueConstraint('model_id', 'category', name='uix_model_category'),
     )
-
-# ==================== TABLE 4: Conversation Archive (OLD - RESTORED) ====================
-class ConversationArchive(Base):
-    __tablename__ = "conversation_archives"
-
-    id = Column(Integer, primary_key=True, index=True)
-    session_id = Column(String, index=True)
-    topic_summary = Column(String)
-    full_transcript = Column(String) # JSON string of the chat history
-    archived_at = Column(DateTime, default=datetime.datetime.utcnow)
-
-# ==================== TABLE 5b: User Memory (Feature 12) ====================
-class UserMemory(Base):
-    """
-    Persistent memory store per user. Extracted automatically from responses.
-    Prepended to future prompts so the model 'remembers' user preferences.
-    e.g. 'User prefers Python', 'User is building an ore detection pipeline'
-    """
-    __tablename__ = "user_memory"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(String, index=True, nullable=False)
-    memory_text = Column(Text, nullable=False)  # The remembered fact
-    source_conversation_id = Column(Integer, nullable=True)  # Which conversation created this
-    importance = Column(Float, default=0.5)     # 0.0 (low) to 1.0 (critical)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
-    last_used = Column(DateTime, default=datetime.datetime.utcnow)
 
 
 # ==================== TABLE 5: Model Performance Tracking (NEW - LEARNING) ====================

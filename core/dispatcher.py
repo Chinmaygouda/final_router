@@ -22,64 +22,68 @@ load_dotenv()
 OPERATOR_SYSTEM_PROMPT = os.getenv("OPERATOR_SYSTEM_PROMPT", "")
 
 # ── CATEGORY-AWARE SYSTEM PROMPTS ────────────────────────────────────────────
-SYSTEM_PROMPTS = {
-    "CODE": (
-        "You are an expert software engineer. "
-        "When asked to code, design, or build something, you MUST provide: "
-        "1) Complete, working, runnable code with no placeholders. "
-        "2) Clear inline comments explaining key steps. "
-        "3) A brief explanation of the architecture after the code. "
-        "Always use proper markdown code blocks (```python, ```bash etc.)."
-    ),
-    "AGENTS": (
-        "You are an expert AI systems architect. "
-        "When asked to design an agent or agentic pipeline, provide: "
-        "1) A complete working implementation with all components. "
-        "2) Agent loop, tool definitions, and orchestration logic in code. "
-        "3) Architecture diagram in text/ASCII if helpful. "
-        "Always use markdown code blocks for all code."
-    ),
-    "ANALYSIS": (
-        "You are an expert data scientist and analyst. "
-        "Provide thorough, structured analysis with: "
-        "1) Key findings clearly stated. "
-        "2) Supporting code or queries where applicable. "
-        "3) Actionable conclusions. "
-        "Use markdown headers and bullet points for clarity."
-    ),
-    "EXTRACTION": (
-        "You are an expert at data extraction and processing. "
-        "Provide complete extraction code/scripts with error handling. "
-        "Always show sample output and explain the data schema."
-    ),
-    "CREATIVE": (
-        "You are a creative writing expert. "
-        "Provide high-quality, original creative content. "
-        "Be imaginative, use vivid language, and fulfill the request fully."
-    ),
-    "UTILITY": (
-        "You are a knowledgeable, helpful assistant. "
-        "Provide clear, complete, and accurate answers. "
-        "Include examples where helpful."
-    ),
-    "CHAT": (
-        "You are a friendly, knowledgeable conversational assistant. "
-        "Be concise but complete. Ask clarifying questions if the request is ambiguous."
-    ),
+HEAVY_SYSTEM_PROMPTS = {
+    "CODE": "Engineer: runnable code; no placeholders; inline comments; architecture; markdown.",
+    "AGENTS": "Architect: full impl; loop/tools/orch; ASCII if useful; markdown.",
+    "ANALYSIS": "Analyst: findings; code/queries; actionable conclusions; structured.",
+    "EXTRACTION": "Extractor: full scripts; error handling; sample + schema.",
+    "CREATIVE": "Writer: original, vivid, complete content.",
+    "UTILITY": "Assistant: clear, accurate answers; examples if useful.",
+    "CHAT": "Assistant: concise; clear; ask if unclear."
 }
-DEFAULT_SYSTEM_PROMPT = SYSTEM_PROMPTS["UTILITY"]
+
+MEDIUM_SYSTEM_PROMPTS = {
+    "CODE": "Engineer: code + brief explanation; markdown.",
+    "AGENTS": "Architect: agent code; markdown.",
+    "ANALYSIS": "Analyst: structured analysis; findings.",
+    "EXTRACTION": "Extractor: scripts/code.",
+    "CREATIVE": "Writer: original, vivid content.",
+    "UTILITY": "Assistant: clear answers.",
+    "CHAT": "Assistant: concise."
+}
+
+LIGHT_SYSTEM_PROMPTS = {
+    "CODE": "Engineer: code only; no explanation.",
+    "AGENTS": "Architect: code only; no explanation.",
+    "ANALYSIS": "Analyst: findings only; concise.",
+    "EXTRACTION": "Extractor: script only.",
+    "CREATIVE": "Writer: creative, concise.",
+    "UTILITY": "Assistant: direct; no filler.",
+    "CHAT": "Assistant: short; no filler."
+}
+
+DEFAULT_SYSTEM_PROMPT = MEDIUM_SYSTEM_PROMPTS["UTILITY"]
 
 
-def _build_system_prompt(category: str) -> str:
+def _get_max_tokens(complexity_score: float) -> int:
     """
-    Builds the full system prompt by combining:
-      1. Operator-level system prompt (from .env) — applies to ALL requests
-      2. Category-aware prompt (CODE, CHAT, ANALYSIS, etc.)
+    Implements the 'Double Lock' token ceiling.
+    Prevents runaway hallucination loops by setting strict max_tokens.
     """
-    category_prompt = SYSTEM_PROMPTS.get(category.upper(), DEFAULT_SYSTEM_PROMPT)
+    if complexity_score < 4.0:
+        return 500
+    elif complexity_score <= 7.0:
+        return 2000
+    else:
+        return 8192
+
+def _build_system_prompt(category: str, complexity_score: float) -> str:
+    """
+    Returns a dynamic system prompt based on category and complexity tier.
+    Operator-level prompt from .env is prepended if set.
+    """
+    if complexity_score < 4.0:
+        prompts_dict = LIGHT_SYSTEM_PROMPTS
+    elif complexity_score > 7.0:
+        prompts_dict = HEAVY_SYSTEM_PROMPTS
+    else:
+        prompts_dict = MEDIUM_SYSTEM_PROMPTS
+        
+    base = prompts_dict.get(category.upper(), DEFAULT_SYSTEM_PROMPT)
+
     if OPERATOR_SYSTEM_PROMPT:
-        return f"{OPERATOR_SYSTEM_PROMPT}\n\n{category_prompt}"
-    return category_prompt
+        return f"{OPERATOR_SYSTEM_PROMPT}\n\n{base}"
+    return base
 
 
 # ── VISION-CAPABLE MODELS (Feature 6) ────────────────────────────────────────
@@ -204,6 +208,7 @@ class Dispatcher:
         model_id: str,
         prompt: str,
         category: str = "UTILITY",
+        complexity_score: float = 5.0,
         image_b64: Optional[str] = None,
         image_url: Optional[str] = None,
         system_prompt_override: Optional[str] = None,
@@ -218,7 +223,7 @@ class Dispatcher:
           - image_b64 / image_url: enables vision/multi-modal (Feature 6)
           - OPERATOR_SYSTEM_PROMPT is automatically prepended (Feature 13)
         """
-        system_prompt = _build_system_prompt(category)
+        system_prompt = _build_system_prompt(category, complexity_score)
         if system_prompt_override:
             system_prompt = f"{system_prompt_override}\n\n{system_prompt}"
             
@@ -241,7 +246,8 @@ class Dispatcher:
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user",   "content": user_content}
-                    ]
+                    ],
+                    max_tokens=_get_max_tokens(complexity_score)
                 )
                 return {
                     "text":    response.choices[0].message.content,
@@ -277,7 +283,7 @@ class Dispatcher:
 
                     response = client.messages.create(
                         model=model_id,
-                        max_tokens=4096,
+                        max_tokens=_get_max_tokens(complexity_score),
                         system=system_prompt,
                         messages=[{"role": "user", "content": user_content}]
                     )
@@ -319,7 +325,7 @@ class Dispatcher:
                     contents=contents,
                     config=genai_types.GenerateContentConfig(
                         system_instruction=system_prompt,
-                        max_output_tokens=8192,
+                        max_output_tokens=_get_max_tokens(complexity_score),
                     )
                 )
                 return {
@@ -339,7 +345,8 @@ class Dispatcher:
                         response = self.client_cohere.chat(
                             model=model_id,
                             preamble=system_prompt,
-                            message=prompt
+                            message=prompt,
+                            max_tokens=_get_max_tokens(complexity_score)
                         )
                         return {
                             "text":    response.text,
@@ -364,6 +371,7 @@ class Dispatcher:
         model_id: str,
         prompt: str,
         category: str = "UTILITY",
+        complexity_score: float = 5.0,
         image_b64: Optional[str] = None,
         image_url: Optional[str] = None,
         system_prompt_override: Optional[str] = None,
@@ -372,7 +380,7 @@ class Dispatcher:
         """
         Standardized streaming execution.
         """
-        system_prompt = _build_system_prompt(category)
+        system_prompt = _build_system_prompt(category, complexity_score)
         if system_prompt_override:
             system_prompt = f"{system_prompt_override}\n\n{system_prompt}"
             
@@ -397,6 +405,7 @@ class Dispatcher:
                         {"role": "user",   "content": user_content},
                     ],
                     stream=True,
+                    max_tokens=_get_max_tokens(complexity_score)
                 )
                 for chunk in stream:
                     delta = chunk.choices[0].delta.content
@@ -417,7 +426,7 @@ class Dispatcher:
 
                     with client.messages.stream(
                         model=model_id,
-                        max_tokens=4096,
+                        max_tokens=_get_max_tokens(complexity_score),
                         system=system_prompt,
                         messages=[{"role": "user", "content": prompt}]
                     ) as stream:
@@ -462,7 +471,7 @@ class Dispatcher:
                     contents=contents,
                     config=genai_types.GenerateContentConfig(
                         system_instruction=config_system_prompt,
-                        max_output_tokens=8192,
+                        max_output_tokens=_get_max_tokens(complexity_score),
                     )
                 ):
                     if chunk.text:
@@ -479,7 +488,8 @@ class Dispatcher:
                         for event in self.client_cohere.chat_stream(
                             model=model_id,
                             preamble=system_prompt,
-                            message=prompt
+                            message=prompt,
+                            max_tokens=_get_max_tokens(complexity_score)
                         ):
                             if hasattr(event, "text") and event.text:
                                 yield event.text
