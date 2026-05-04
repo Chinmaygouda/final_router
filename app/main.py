@@ -314,8 +314,10 @@ async def ask_unified(request: QueryRequest):
                 circuit_breaker.record_success(c_model)
                 real_ai_response = response_data["text"]
                 real_tokens_used = response_data.get("tokens", 0)
+                input_tokens = response_data.get("input_tokens", 0)
+                output_tokens = response_data.get("output_tokens", 0)
                 cost = VaultService._calculate_cost(c_provider, c_model, real_tokens_used)
-                print(f"SUCCESS: {c_model} | Tokens: {real_tokens_used} | Cost: ${cost:.4f}")
+                print(f"SUCCESS: {c_model} | Input: {input_tokens} | Output: {output_tokens} | Cost: ${cost:.4f}")
                 model_id = c_model
                 provider = c_provider
                 execution_success = True
@@ -398,6 +400,8 @@ async def ask_unified(request: QueryRequest):
                     "category": category,
                     "tier": tier,
                     "tokens_consumed": real_tokens_used,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
                     "cost_usd": round(cost, 4),
                     "latency_seconds": round(execution_latency, 2)
                 }

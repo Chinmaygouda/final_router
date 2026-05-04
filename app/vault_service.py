@@ -196,6 +196,8 @@ class VaultService:
                 image_b64=image_base64,
                 image_url=image_url,
             )
+            if response.get("success"):
+                print(f"   [TOKENS] Input: {response.get('input_tokens', 0)} | Output: {response.get('output_tokens', 0)}")
             return response
         except Exception as e:
             print(f"❌ Dispatcher error: {e}")

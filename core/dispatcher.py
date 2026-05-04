@@ -23,33 +23,33 @@ OPERATOR_SYSTEM_PROMPT = os.getenv("OPERATOR_SYSTEM_PROMPT", "")
 
 # ── CATEGORY-AWARE SYSTEM PROMPTS ────────────────────────────────────────────
 HEAVY_SYSTEM_PROMPTS = {
-    "CODE": "Engineer: runnable code; no placeholders; inline comments; architecture; markdown.",
-    "AGENTS": "Architect: full impl; loop/tools/orch; ASCII if useful; markdown.",
-    "ANALYSIS": "Analyst: findings; code/queries; actionable conclusions; structured.",
-    "EXTRACTION": "Extractor: full scripts; error handling; sample + schema.",
-    "CREATIVE": "Writer: original, vivid, complete content.",
-    "UTILITY": "Assistant: clear, accurate answers; examples if useful.",
-    "CHAT": "Assistant: concise; clear; ask if unclear."
+    "CODE": "Engineer runnable code no placeholders inline comments architecture markdown",
+    "AGENTS": "Architect full impl loop tools orch ASCII if useful markdown",
+    "ANALYSIS": "Analyst findings code queries actionable conclusions structured",
+    "EXTRACTION": "Extractor full scripts error handling sample schema",
+    "CREATIVE": "Writer original vivid complete content",
+    "UTILITY": "Assistant clear accurate answers examples if useful",
+    "CHAT": "Assistant concise clear ask if unclear"
 }
 
 MEDIUM_SYSTEM_PROMPTS = {
-    "CODE": "Engineer: code + brief explanation; markdown.",
-    "AGENTS": "Architect: agent code; markdown.",
-    "ANALYSIS": "Analyst: structured analysis; findings.",
-    "EXTRACTION": "Extractor: scripts/code.",
-    "CREATIVE": "Writer: original, vivid content.",
-    "UTILITY": "Assistant: clear answers.",
-    "CHAT": "Assistant: concise."
+    "CODE": "Engineer code brief explanation markdown",
+    "AGENTS": "Architect agent code markdown",
+    "ANALYSIS": "Analyst structured analysis findings",
+    "EXTRACTION": "Extractor scripts code",
+    "CREATIVE": "Writer original vivid content",
+    "UTILITY": "Assistant clear answers",
+    "CHAT": "Assistant concise"
 }
 
 LIGHT_SYSTEM_PROMPTS = {
-    "CODE": "Engineer: code only; no explanation.",
-    "AGENTS": "Architect: code only; no explanation.",
-    "ANALYSIS": "Analyst: findings only; concise.",
-    "EXTRACTION": "Extractor: script only.",
-    "CREATIVE": "Writer: creative, concise.",
-    "UTILITY": "Assistant: direct; no filler.",
-    "CHAT": "Assistant: short; no filler."
+    "CODE": "Engineer code only no explanation",
+    "AGENTS": "Architect code only no explanation",
+    "ANALYSIS": "Analyst findings only concise",
+    "EXTRACTION": "Extractor script only",
+    "CREATIVE": "Writer creative concise",
+    "UTILITY": "Assistant direct no filler",
+    "CHAT": "Assistant short no filler"
 }
 
 DEFAULT_SYSTEM_PROMPT = MEDIUM_SYSTEM_PROMPTS["UTILITY"]
@@ -252,6 +252,8 @@ class Dispatcher:
                 return {
                     "text":    response.choices[0].message.content,
                     "tokens":  response.usage.total_tokens if response.usage else 0,
+                    "input_tokens": response.usage.prompt_tokens if response.usage else 0,
+                    "output_tokens": response.usage.completion_tokens if response.usage else 0,
                     "success": True,
                 }
 
@@ -287,8 +289,15 @@ class Dispatcher:
                         system=system_prompt,
                         messages=[{"role": "user", "content": user_content}]
                     )
-                    tokens = response.usage.input_tokens + response.usage.output_tokens
-                    return {"text": response.content[0].text, "tokens": tokens, "success": True}
+                    input_tokens = response.usage.input_tokens
+                    output_tokens = response.usage.output_tokens
+                    return {
+                        "text": response.content[0].text,
+                        "tokens": input_tokens + output_tokens,
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "success": True
+                    }
                 except ImportError:
                     return {"text": "Error: Anthropic SDK not installed. Run: pip install anthropic", "tokens": 0, "success": False}
 
@@ -331,6 +340,8 @@ class Dispatcher:
                 return {
                     "text":    response.text,
                     "tokens":  response.usage_metadata.total_token_count if response.usage_metadata else 0,
+                    "input_tokens": response.usage_metadata.prompt_token_count if response.usage_metadata else 0,
+                    "output_tokens": response.usage_metadata.candidates_token_count if response.usage_metadata else 0,
                     "success": True,
                 }
 
@@ -351,6 +362,8 @@ class Dispatcher:
                         return {
                             "text":    response.text,
                             "tokens":  response.meta.tokens.total_tokens if response.meta else 0,
+                            "input_tokens": response.meta.tokens.input_tokens if response.meta and response.meta.tokens else 0,
+                            "output_tokens": response.meta.tokens.output_tokens if response.meta and response.meta.tokens else 0,
                             "success": True,
                         }
                     return {"text": "Error: Cohere API key not configured.", "tokens": 0, "success": False}
